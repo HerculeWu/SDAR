@@ -2,6 +2,7 @@
 
 #include "Common/Float.h"
 #include "Common/list.h"
+#include "Common/taskflow_manager.h"
 #include "AR/symplectic_integrator.h"
 #include "Hermite/ar_information.h"
 #include "Hermite/hermite_particle.h"
@@ -960,28 +961,58 @@ namespace H4{
             auto* pred_ptr = pred_.getDataAddress();
             auto* force_ptr = force_.getDataAddress();
             auto* neighbor_ptr = neighbors.getDataAddress();
-            for (int k=0; k<_n_single; k++) {
-                const int i = _index_single[k];
-                auto& pi = pred_ptr[i];
-                auto& fi = force_ptr[i];
-                auto& nbi = neighbor_ptr[i];
-                calcOneSingleAccJerkNB(fi, nbi, pi, pi.id);
+            auto& tf = TF::Manager::get_taskflow();
+            auto& exec = TF::Manager::get_executor();
+            if (_n_single > 10) {
+                // std::cerr << "use tf in calculate force for singles, _n_single = " << _n_single << std::endl;
+                tf.clear();
+                tf.for_each_index(0, _n_single, 1, [&_index_single, &pred_ptr, &force_ptr, &neighbor_ptr, this](int k){
+                    const int i = _index_single[k];
+                    auto& pi = pred_ptr[i];
+                    auto& fi = force_ptr[i];
+                    auto& nbi = neighbor_ptr[i];
+                    calcOneSingleAccJerkNB(fi, nbi, pi, pi.id);
+                });
+                exec.run(tf).wait();
+            } else {
+                for (int k=0; k<_n_single; k++) {
+                    const int i = _index_single[k];
+                    auto& pi = pred_ptr[i];
+                    auto& fi = force_ptr[i];
+                    auto& nbi = neighbor_ptr[i];
+                    calcOneSingleAccJerkNB(fi, nbi, pi, pi.id);
+                }
             }
 
             // for group active particles
             auto* group_ptr = groups.getDataAddress();
-            
-            for (int k=0; k<_n_group; k++) {
-                const int i = _index_group[k];
-                auto& groupi = group_ptr[i];
-                // use predictor of cm
-                auto& pi = pred_ptr[i+index_offset_group_];
-                auto& fi = force_ptr[i+index_offset_group_];
-                if (groupi.particles.cm.mass>0) {
-                    if (groupi.perturber.need_resolve_flag) calcOneGroupMemberAccJerkNB(fi, groupi, pi);
-                    else calcOneGroupCMAccJerkNB(fi, groupi, pi);
+            if (_n_group > 10) {
+                tf.clear();
+                tf.for_each_index(0, _n_group, 1, [&_index_group, &group_ptr, &pred_ptr, &force_ptr, this](int k){
+                    const int i = _index_group[k];
+                    auto& groupi = group_ptr[i];
+                    // use predictor of cm
+                    auto& pi = pred_ptr[i+index_offset_group_];
+                    auto& fi = force_ptr[i+index_offset_group_];
+                    if (groupi.particles.cm.mass>0) {
+                        if (groupi.perturber.need_resolve_flag) calcOneGroupMemberAccJerkNB(fi, groupi, pi);
+                        else calcOneGroupCMAccJerkNB(fi, groupi, pi);
+                    }
+                    else calcOneSingleAccJerkNB(fi, groupi.perturber, pi, pi.id);
+                });
+            } else {
+                for (int k=0; k<_n_group; k++) {
+                    const int i = _index_group[k];
+                    auto& groupi = group_ptr[i];
+                    // use predictor of cm
+                    auto& pi = pred_ptr[i+index_offset_group_];
+                    auto& fi = force_ptr[i+index_offset_group_];
+                    if (groupi.particles.cm.mass>0) {
+                        if (groupi.perturber.need_resolve_flag) calcOneGroupMemberAccJerkNB(fi, groupi, pi);
+                        else calcOneGroupCMAccJerkNB(fi, groupi, pi);
+                    }
+                    else calcOneSingleAccJerkNB(fi, groupi.perturber, pi, pi.id);
                 }
-                else calcOneSingleAccJerkNB(fi, groupi.perturber, pi, pi.id);
             }
         }
 

@@ -1,3 +1,6 @@
+# Change of this repo
+This repo add parallarization of ```Hermite``` integrator for Hermite integration (AR still in single thread). I use ```cpp-taskflow``` to implement the parallarization. Note, you need to get the library from my fork, because the original ```cpp-taskflow``` does not allow large stack size of each thread.
+
 # SDAR: A library for solving few-body problems
 Please read this short manual before start to use the code. 
 Any questions that are already answered here won't get reply from developers and GitHub Issue.
