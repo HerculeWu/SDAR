@@ -163,6 +163,39 @@ namespace AR {
         }
     };
 
+#ifdef AR_STEP_TRACE
+    //! Temporary recording hook for the Regularization step control fixtures
+    /*! Appends one record per integrateToTime call to the file named by the environment variable AR_STEP_TRACE_FILE.
+        The format is described in test/fixtures/step_control/README.md
+     */
+    struct StepTrace {
+        FILE* file;
+        Float ds_persist;
+
+        StepTrace(): file(NULL), ds_persist(0.0) {
+            const char* name = getenv("AR_STEP_TRACE_FILE");
+            if (name!=NULL) file = fopen(name, "a");
+        }
+
+        ~StepTrace() { if (file!=NULL) fclose(file); }
+
+        //! record the persistent Regularization step when it changed
+        void persist(const Float _ds) {
+            if (file!=NULL && _ds!=ds_persist) {
+                fprintf(file, "D %a\n", (double)_ds);
+                ds_persist = _ds;
+            }
+        }
+
+        void end(const char* _status, const Float _ds, const int _fix_step_option, const long long unsigned int _step_count, const long long unsigned int _step_count_tsyn) {
+            if (file!=NULL) {
+                persist(_ds);
+                fprintf(file, "END %s %a %d %llu %llu\n", _status, (double)_ds, _fix_step_option, _step_count, _step_count_tsyn);
+            }
+        }
+    };
+#endif
+
     //! Time Transformed Symplectic integrator class for a group of particles
     /*! The basic steps to use the integrator \n
       1. Add particles (particles.addParticle/particles.linkParticleList)  \n
@@ -2094,14 +2127,28 @@ namespace AR {
             for (int i=0; i<info.binarytree.getSize(); i++)
                 info.binarytree[i].stab_check_time = time_;
 
+#ifdef AR_STEP_TRACE
+            StepTrace step_trace;
+            step_trace.ds_persist = info.ds;
+            if (step_trace.file!=NULL)
+                fprintf(step_trace.file, "BEGIN %a %d %a %a %a %a %llu %d %d\n", (double)info.ds, (int)info.fix_step_option, (double)time_, (double)_time_end,
+                        (double)time_error, (double)energy_error_rel_max, manager->step_count_max, manager->step.getOrder(), cd_pair_size);
+#endif
+
             // integration loop
             while(true) {
+#ifdef AR_STEP_TRACE
+                step_trace.persist(info.ds);
+#endif
                 // backup data
                 bool binary_update_flag=false;
                 auto& bin_root = info.getBinaryTreeRoot();
                 auto& G = manager->interaction.gravitational_constant;
                 
                 if(backup_flag) {
+#ifdef AR_STEP_TRACE
+                    if (step_trace.file!=NULL) fprintf(step_trace.file, "C\n");
+#endif
                     // check interrupt condiction, ensure that time end not reach
                     if (manager->interrupt_detection_option>0 && !time_end_flag) {
                         bin_interrupt.time_now = time_ + info.time_offset;
@@ -2124,6 +2171,10 @@ namespace AR {
                                 profile.step_count_sum += step_count;
                                 profile.step_count_tsyn_sum += step_count_tsyn;
 
+#ifdef AR_STEP_TRACE
+                                if (step_trace.file!=NULL) fprintf(step_trace.file, "X\n");
+                                step_trace.end("stop", info.ds, (int)info.fix_step_option, step_count, step_count_tsyn);
+#endif
                                 return bin_interrupt;
                             }
                             else {
@@ -2171,6 +2222,10 @@ namespace AR {
                                     Float dt = _time_end - time_;
                                     time_ += dt;
 
+#ifdef AR_STEP_TRACE
+                                    if (step_trace.file!=NULL) fprintf(step_trace.file, "X\n");
+                                    step_trace.end("stop", info.ds, (int)info.fix_step_option, step_count, step_count_tsyn);
+#endif
                                     return bin_interrupt;
                                 }
 
@@ -2290,11 +2345,18 @@ namespace AR {
 
                                         time_ += dt;
 
+#ifdef AR_STEP_TRACE
+                                        if (step_trace.file!=NULL) fprintf(step_trace.file, "X\n");
+                                        step_trace.end("stop", info.ds, (int)info.fix_step_option, step_count, step_count_tsyn);
+#endif
                                         return bin_interrupt;
                                     }
                                     // if only two particles have mass, switch off auto ds adjustment
                                     if (count_mass==2) {
                                         info.fix_step_option=FixStepOption::later;
+#ifdef AR_STEP_TRACE
+                                        if (step_trace.file!=NULL) fprintf(step_trace.file, "O %d\n", (int)info.fix_step_option);
+#endif
                                     }
                                     //else {
                                     //    info.generateBinaryTree(particles, G);
@@ -2306,6 +2368,9 @@ namespace AR {
 #endif
 
                                 info.ds = info.calcDsKeplerBinaryTree(*bin_interrupt.adr, manager->step.getOrder(), G, manager->ds_scale);
+#ifdef AR_STEP_TRACE
+                                if (step_trace.file!=NULL) fprintf(step_trace.file, "R I %a\n", (double)info.ds);
+#endif
                                 Float ds_max = manager->step.calcStepModifyFactorFromErrorRatio(2.0)*ds_init;
                                 Float ds_min = manager->step.calcStepModifyFactorFromErrorRatio(0.5)*ds_init;
                                 if (info.ds>ds_max || info.ds<ds_min) {
@@ -2351,6 +2416,9 @@ namespace AR {
                             std::cerr<<"Update binary tree orbits, time= "<<time_<<"\n";
 #endif
                             info.ds = info.calcDsKeplerBinaryTree(bin_root, manager->step.getOrder(), G, manager->ds_scale);
+#ifdef AR_STEP_TRACE
+                            if (step_trace.file!=NULL) fprintf(step_trace.file, "R B %a\n", (double)info.ds);
+#endif
                             if (abs(ds_init-info.ds)/ds_init>0.1) {
 #ifdef AR_DEBUG_PRINT
                                 std::cerr<<"Change ds after update binary orbit: ds(init): "<<ds_init<<" ds(new): "<<info.ds<<" ds(now): "<<ds[0]<<std::endl;
@@ -2364,12 +2432,19 @@ namespace AR {
                         }
                     }
 
+#ifdef AR_STEP_TRACE
+                    step_trace.persist(info.ds);
+                    if (step_trace.file!=NULL) fprintf(step_trace.file, "S\n");
+#endif
                     int bk_return_size = backupIntData(backup_data);
                     ASSERT(bk_return_size == bk_data_size);
                     (void)bk_return_size;
 
                 }
                 else { //restore data
+#ifdef AR_STEP_TRACE
+                    if (step_trace.file!=NULL) fprintf(step_trace.file, "T\n");
+#endif
                     int bk_return_size = restoreIntData(backup_data);
                     ASSERT(bk_return_size == bk_data_size);
                     (void)bk_return_size;
@@ -2421,6 +2496,16 @@ namespace AR {
                 Float integration_error_rel_cum_abs = abs(H);
 
                 Float integration_error_ratio = energy_error_rel_max/integration_error_rel_abs;
+
+#ifdef AR_STEP_TRACE
+                if (step_trace.file!=NULL) {
+                    fprintf(step_trace.file, "P %a %a %a", (double)ds[ds_switch], (double)time_, (double)integration_error_rel_abs);
+                    // the sub-step time table is only read when the step overshoots the time end
+                    if (time_ > _time_end + time_error)
+                        for (int i=0; i<cd_pair_size; i++) fprintf(step_trace.file, " %a", (double)time_table[i]);
+                    fprintf(step_trace.file, "\n");
+                }
+#endif
       
                 // time error
                 Float time_diff_rel = (_time_end - time_)/dt_full;
@@ -2821,6 +2906,10 @@ namespace AR {
                     break;
                 }
             }
+
+#ifdef AR_STEP_TRACE
+            step_trace.end("reach", info.ds, (int)info.fix_step_option, step_count, step_count_tsyn);
+#endif
 
             // cumulative step count 
             profile.step_count = step_count;
