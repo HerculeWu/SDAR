@@ -2,6 +2,7 @@
 #include "Common/Float.h"
 #include "Common/binary_tree.h"
 #include "AR/slow_down.h"
+#include "AR/fix_step_option.h"
 
 namespace AR {
 
@@ -70,13 +71,6 @@ namespace AR {
     //! define ar binary tree
     template <class Tparticle>
     using BinaryTree=COMM::BinaryTree<Tparticle,BinarySlowDown>;
-
-    //! Fix step options for integration with adjusted step (not for time sychronizatio phase)
-    /*! always: use the given step without change \n
-        later: fix step after a few adjustment of initial steps due to energy error
-        none: don't fix step
-     */
-    enum class FixStepOption {always, later, none};
 
     //! A class contains information (e.g. parameters, binary tree, indices) about the particle group
     /*! The member of this class should not be the data that must be recored and should be possible calculated any time based on the main class (TimeTransformedSymplecticIntegrator) data. 

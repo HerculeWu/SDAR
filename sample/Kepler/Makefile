@@ -38,7 +38,7 @@ endif
 
 ## Flag ----------------------------------------------#
 CXXFLAGS += -I../../src -I./
-CXXFLAGS += -std=c++11
+CXXFLAGS += -std=c++20
 #CXXFLAGS += -D BRANCH_CHECK
 
 ## qd-lib---------------------------------------------#

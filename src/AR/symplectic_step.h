@@ -314,7 +314,7 @@ namespace AR {
         /*! 
           @param[in] _error_new_over_old: integration error change ratio expected to reach after modify step size (expected new error / old error)
          */
-        Float calcStepModifyFactorFromErrorRatio(const Float _error_new_over_old) {
+        Float calcStepModifyFactorFromErrorRatio(const Float _error_new_over_old) const {
             return pow(_error_new_over_old, Float(1.0/sym_order_));
         }
 
@@ -322,7 +322,7 @@ namespace AR {
         /*! 
           @param[in] _step_new_over_old: step size modify ratio (new step size / old)
          */
-        Float calcErrorRatioFromStepModifyFactor(const Float _step_new_over_old) {
+        Float calcErrorRatioFromStepModifyFactor(const Float _step_new_over_old) const {
             return pow(_step_new_over_old, Float(sym_order_));
         }
 

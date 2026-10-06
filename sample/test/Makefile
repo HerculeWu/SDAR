@@ -32,7 +32,7 @@ endif
 
 ## Flag ----------------------------------------------#
 CXXFLAGS += -I../../src -I./
-CXXFLAGS += -std=c++11
+CXXFLAGS += -std=c++20
 
 ## OpenMP flag----------------------------------------#
 #CXXFLAGS += -fopenmp -D USE_OMP

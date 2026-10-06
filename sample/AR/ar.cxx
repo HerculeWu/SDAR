@@ -23,7 +23,15 @@
 
 using namespace AR;
 
-typedef TimeTransformedSymplecticIntegrator<Particle, Particle, Perturber, Interaction, Information<Particle,Particle>> ARInt;
+// The variant is selected at the integrator type: time transformation (LogH or TTL) and Slow-down scheme (none, Array or Tree).
+// The defaults follow the variant flags of the Makefile, one binary per combination.
+typedef TimeTransformedSymplecticIntegrator<Particle, Particle, Perturber, Interaction, Information<Particle,Particle>, DefaultTimeTransformation, DefaultSlowDownScheme> ARInt;
+
+//! update Slow-down factors before a step, if the integrator uses a Slow-down scheme
+template <class Tint>
+void updateSlowDown(Tint& _int) {
+    if constexpr (Tint::hasSlowDown()) _int.updateSlowDownAndCorrectEnergy(true, false);
+}
 
 int main(int argc, char **argv){
 
@@ -58,16 +66,9 @@ int main(int argc, char **argv){
     bool load_flag=false;  // if true; load dumped data
     bool synch_flag=false; // if true, switch on time synchronization
 
-#ifdef AR_TTL
-    std::string bin_name("ar.ttl");
-#else
-    std::string bin_name("ar.logh");
-#endif
-#ifdef AR_SLOWDOWN_ARRAY
-    bin_name += ".sd.a";
-#elif AR_SLOWDOWN_TREE
-    bin_name += ".sd.t";
-#endif
+    std::string bin_name(ARInt::isTTL() ? "ar.ttl" : "ar.logh");
+    if (ARInt::isSlowDownArray()) bin_name += ".sd.a";
+    else if (ARInt::isSlowDownTree()) bin_name += ".sd.t";
 
     int copt;
     static struct option long_options[] = {
@@ -328,13 +329,7 @@ int main(int argc, char **argv){
     // precision
     std::cout<<std::setprecision(print_precision.value);
 
-#ifdef AR_SLOWDOWN_ARRAY
-    int n_sd = sym_int.binary_slowdown.getSize();
-#elif AR_SLOWDOWN_TREE
-    int n_sd = sym_int.info.binarytree.getSize();
-#else
-    int n_sd = 0;
-#endif
+    int n_sd = sym_int.getSlowDownInnerNumber();
     //print column title
     sym_int.printColumnTitle(std::cout, print_width.value, n_sd);
     std::cout<<std::endl;
@@ -351,9 +346,7 @@ int main(int argc, char **argv){
         Float time_table[manager.step.getCDPairSize()];
         sym_int.profile.step_count = 1;
         auto IntegrateOneStep = [&] (){
-#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
-            sym_int.updateSlowDownAndCorrectEnergy(true, false);
-#endif
+            updateSlowDown(sym_int);
             if(n_particle==2) sym_int.integrateTwoOneStep(sym_int.info.ds, time_table);
             else sym_int.integrateOneStep(sym_int.info.ds, time_table);
             if (sym_int.getTime()>=time_out) {

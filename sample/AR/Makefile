@@ -42,7 +42,7 @@ endif
 
 ## Flag ----------------------------------------------#
 CXXFLAGS += -I../../src -I./
-CXXFLAGS += -std=c++11
+CXXFLAGS += -std=c++20
 
 ## OpenMP flag----------------------------------------#
 #CXXFLAGS += -fopenmp -D USE_OMP
@@ -76,8 +76,10 @@ ar.logh.sd.t: ar.cxx ${SOURCE}
 ar.ttl: ar.cxx ${SOURCE}
 	$(CXX) $(CXXFLAGS) -D AR_TTL $< -o $@ $(CXXLIBS)
 
-ar.ttl.m: ar.cxx ${SOURCE}
-	$(CXX) $(CXXFLAGS) -D AR_TTL -D AR_TTL_GT_MULTI $< -o $@ $(CXXLIBS)
+# No code reads AR_TTL_GT_MULTI; see the reference block on the multiplied
+# inverse-separation time function in src/AR/symplectic_integrator.h
+#ar.ttl.m: ar.cxx ${SOURCE}
+#	$(CXX) $(CXXFLAGS) -D AR_TTL -D AR_TTL_GT_MULTI $< -o $@ $(CXXLIBS)
 
 ar.ttl.sd.a: ar.cxx ${SOURCE}
 	$(CXX) $(CXXFLAGS) -D AR_TTL -D AR_SLOWDOWN_ARRAY -D AR_SLOWDOWN_TIMESCALE  $< -o $@ $(CXXLIBS)
