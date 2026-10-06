@@ -207,6 +207,8 @@ TEST_CASE_FIXTURE(Fixture, "synchronization: failure is returned as a status") {
     CHECK(c.advanceTo(stepper, 2.5)==StepControlStatus::failed_to_synchronize);
     CHECK(c.getStepCountSync()==6);
     CHECK(c.getStepCount()==7);
+    // the last report tells the stepper, which does the printing
+    CHECK(stepper.events.back()==StepEvent::synchronization_failed);
 }
 
 TEST_CASE_FIXTURE(Fixture, "negative step: Physical time moving backwards before the target is retried with a smaller step") {

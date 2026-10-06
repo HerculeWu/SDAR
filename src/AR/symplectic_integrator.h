@@ -4,6 +4,7 @@
 #include "Common/list.h"
 #include "Common/particle_group.h"
 #include "AR/symplectic_step.h"
+#include "AR/regularization_step_control.h"
 #include "AR/force.h"
 #include "AR/slow_down.h"
 #include "AR/profile.h"
@@ -162,39 +163,6 @@ namespace AR {
             step.print(_fout);
         }
     };
-
-#ifdef AR_STEP_TRACE
-    //! Temporary recording hook for the Regularization step control fixtures
-    /*! Appends one record per integrateToTime call to the file named by the environment variable AR_STEP_TRACE_FILE.
-        The format is described in test/fixtures/step_control/README.md
-     */
-    struct StepTrace {
-        FILE* file;
-        Float ds_persist;
-
-        StepTrace(): file(NULL), ds_persist(0.0) {
-            const char* name = getenv("AR_STEP_TRACE_FILE");
-            if (name!=NULL) file = fopen(name, "a");
-        }
-
-        ~StepTrace() { if (file!=NULL) fclose(file); }
-
-        //! record the persistent Regularization step when it changed
-        void persist(const Float _ds) {
-            if (file!=NULL && _ds!=ds_persist) {
-                fprintf(file, "D %a\n", (double)_ds);
-                ds_persist = _ds;
-            }
-        }
-
-        void end(const char* _status, const Float _ds, const int _fix_step_option, const long long unsigned int _step_count, const long long unsigned int _step_count_tsyn) {
-            if (file!=NULL) {
-                persist(_ds);
-                fprintf(file, "END %s %a %d %llu %llu\n", _status, (double)_ds, _fix_step_option, _step_count, _step_count_tsyn);
-            }
-        }
-    };
-#endif
 
     //! Time Transformed Symplectic integrator class for a group of particles
     /*! The basic steps to use the integrator \n
@@ -1960,25 +1928,517 @@ namespace AR {
 #endif
         }
         
+    private:
+        //! Working data of one integrateToTime call, shared by the stepper operations
+        struct IntegrateToTimeData {
+            Float time_end;        // target Physical time without offset
+            Float dt_full;         // full Physical time interval of the call
+            Float* backup_data;    // for backup chain data
+            int bk_data_size;
+            Float* time_table;     // for storing sub-integrated time 
+            int n_particle;
+            InterruptBinary<Tparticle> bin_interrupt;
+            InterruptBinary<Tparticle> bin_interrupt_return;
+            bool warning_print_once; // warning print flag
+            // last step, for messages
+            Float energy_error;
+            Float energy_error_bk;
+            Float etot_ref_bk;
+            Float H;
+
+            Float getEnergyErrorRelAbs() const { return abs((energy_error - energy_error_bk)/etot_ref_bk); }
+            // H should be zero initially
+            Float getIntegrationErrorCumAbs() const { return abs(H); }
+        };
+
+        //! Stepper over the integrator, driven by Regularization step control in integrateToTime
+        struct ToTimeStepper {
+            TimeTransformedSymplecticIntegrator& integrator;
+            IntegrateToTimeData& data;
+
+            Float getTime() const { return integrator.time_; }
+
+            CheckpointAction checkpoint(StepCheckpoint& _checkpoint) { return integrator.checkpointToTime(_checkpoint, data); }
+
+            void save() {
+                int bk_return_size = integrator.backupIntData(data.backup_data);
+                ASSERT(bk_return_size == data.bk_data_size);
+                (void)bk_return_size;
+            }
+
+            void restore() {
+                int bk_return_size = integrator.restoreIntData(data.backup_data);
+                ASSERT(bk_return_size == data.bk_data_size);
+                (void)bk_return_size;
+                // binary c.m. is not backup, thus recalculate to get correct c.m. velocity for position drift correction due to slowdown inner (the first drift in integrateonestep assume c.m. vel is up to date)
+                integrator.updateBinaryCMIter(integrator.info.getBinaryTreeRoot());
+            }
+
+            StepOutcome step(const Float _ds) { return integrator.stepToTime(_ds, data); }
+
+            void observe(const StepReport& _report) { integrator.observeToTime(_report, data); }
+        };
+
+        //! request a restart of the Regularization step with a new estimate at a checkpoint
+        void restartRegularizationStep(StepCheckpoint& _checkpoint, const RestartCause _cause, const Float _ds_estimate) {
+#ifdef AR_DEBUG_PRINT
+            Float ds_init = _checkpoint.getStepInit();
+            Float ds_now = _checkpoint.getStepNow();
+#endif
+            bool accepted = _checkpoint.requestRestart(_cause, _ds_estimate);
+            info.ds = _checkpoint.getPersistentStep();
+#ifdef AR_DEBUG_PRINT
+            if (accepted) 
+                std::cerr<<(_cause==RestartCause::interrupt ? "Change ds after interruption" : "Change ds after update binary orbit")
+                         <<": ds(init): "<<ds_init<<" ds(new): "<<_ds_estimate<<" ds(now): "<<ds_now<<std::endl;
+#endif
+            (void)accepted;
+        }
+
+        //! checkpoint of integrateToTime: Interrupt detection and binary update, before the data are backuped
+        /*! 
+          \return stop when an Interrupt is handed back to the caller, abandon when nothing is left to integrate, otherwise proceed
+         */
+        CheckpointAction checkpointToTime(StepCheckpoint& _checkpoint, IntegrateToTimeData& _data) {
+            const Float _time_end = _data.time_end;
+            const int n_particle = _data.n_particle;
+            auto& bin_interrupt = _data.bin_interrupt;
+            auto& bin_interrupt_return = _data.bin_interrupt_return;
+            (void)n_particle;
+
+            bool binary_update_flag=false;
+            auto& bin_root = info.getBinaryTreeRoot();
+            auto& G = manager->interaction.gravitational_constant;
+
+            // check interrupt condiction, ensure that time end not reach
+            if (manager->interrupt_detection_option>0 && !_checkpoint.isSynchronizing()) {
+                bin_interrupt.time_now = time_ + info.time_offset;
+                bin_interrupt.time_end = _time_end + info.time_offset;
+                // calc perturbation energy
+                //Float epert=0.0;
+                //for (int i=0; i<n_particle; i++) {
+                //    epert += force_[i].pot_pert*particles[i].mass;
+                //}
+                manager->interaction.modifyAndInterruptIter(bin_interrupt, bin_root);
+                //InterruptBinary<Tparticle>* bin_intr_ptr = &bin_interrupt;
+                //bin_intr_ptr = bin_root.processRootIter(bin_intr_ptr, Tmethod::modifyAndInterruptIter);
+                ASSERT(bin_interrupt.checkParams());
+                if (bin_interrupt.status!=InterruptStatus::none) {
+                    // the mode return back to the root scope
+                    if (manager->interrupt_detection_option==2) {
+                        return CheckpointAction::stop;
+                    }
+                    else {
+
+                        // check whether destroy appears (all masses becomes zero)
+                        if (bin_interrupt.status==InterruptStatus::destroy) {
+                            // all particles become zero masses
+#ifdef AR_DEBUG
+                            for (int j=0; j<n_particle; j++) {
+                                ASSERT(particles[j].mass==0.0);
+                            }
+#endif
+                            de_change_interrupt_ -= etot_ref_;
+                            dH_change_interrupt_ -= getH();
+                            ekin_ = epot_ = etot_ref_ = 0.0;
+#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
+                            de_sd_change_cum_ -= etot_sd_ref_;
+                            dH_sd_change_interrupt_ -= getHSlowDown();
+                            ekin_sd_ = epot_sd_ = etot_sd_ref_ = 0.0;
+#endif                                    
+#ifdef AR_DEBUG_PRINT
+                            std::cerr<<"Interrupt condition triggered! Destroy";
+                            std::cerr<<" Time: "<<time_;
+                            bin_interrupt.adr->printColumnTitle(std::cerr);
+                            std::cerr<<std::endl;
+                            bin_interrupt.adr->printColumn(std::cerr);
+                            std::cerr<<std::endl;
+                            Tparticle::printColumnTitle(std::cerr);
+                            std::cerr<<std::endl;
+                            for (int j=0; j<2; j++) {
+                                bin_interrupt.adr->getMember(j)->printColumn(std::cerr);
+                                std::cerr<<std::endl;
+                            }
+#endif
+
+                            // set binary tree mass to zero
+                            setBinaryCMZeroIter(bin_root);
+
+                            Float dt = _time_end - time_;
+                            time_ += dt;
+
+                            return CheckpointAction::abandon;
+                        }
+
+                        Float ekin_bk = ekin_;
+                        Float epot_bk = epot_;
+                        Float H_bk = getH();
+
+#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
+                        Float ekin_sd_bk = ekin_sd_;
+                        Float epot_sd_bk = epot_sd_;
+                        Float H_sd_bk = getHSlowDown();
+#endif
+                        
+                        // update binary tree mass
+                        info.generateBinaryTree(particles, G);
+                        //updateBinaryCMIter(bin_root);
+                        //updateBinarySemiEccPeriodIter(bin_root, G, time_, true);
+                        binary_update_flag = true;
+                        //bool stable_check=
+                        //if (stable_check) bin_root.stableCheckIter(bin_root, 10000*bin_root.period);
+                        
+                        // should do later, original mass still needed
+                        //particles.cm.mass += bin_interrupt.dm;
+
+#ifdef AR_TTL
+                        Float gt_kick_inv_new = calcAccPotAndGTKickInv();
+                        Float d_gt_kick_inv = gt_kick_inv_new - gt_kick_inv_;
+                        // when the change is large, initialize gt_drift_inv_ to avoid large error
+                        if (fabs(d_gt_kick_inv)/std::max(fabs(gt_kick_inv_),fabs(gt_kick_inv_new)) >1e-3) 
+                            gt_drift_inv_ = gt_kick_inv_new;
+                        else 
+                            gt_drift_inv_ += d_gt_kick_inv;
+                        gt_kick_inv_ = gt_kick_inv_new;
+#else
+                        calcAccPotAndGTKickInv();
+#endif
+                        // calculate kinetic energy
+                        calcEKin();
+
+                        // Notice initially etot_ref_ does not include epert. The perturbation effect is accumulated in the integration. Here instance change of mass does not create any work. So no need to add de_pert
+                        // get perturbation energy change due to mass change
+                        //Float epert_new = 0.0;
+                        //for (int i=0; i<n_particle; i++) {
+                        //    epert_new += force_[i].pot_pert*particles[i].mass;
+                        //}
+                        //Float de_pert = epert_new - epert; // notice this is double perturbation potential
+
+                        // get energy change
+                        Float de = (ekin_ - ekin_bk) + (epot_ - epot_bk); //+ de_pert;
+                        etot_ref_ += de;
+                        de_change_interrupt_ += de;
+                        dH_change_interrupt_ += getH() - H_bk;
+
+#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
+                        Float de_sd = (ekin_sd_ - ekin_sd_bk) + (epot_sd_ - epot_sd_bk);// + de_pert;
+                        etot_sd_ref_ += de_sd;
+
+                        Float dH_sd = getHSlowDown() - H_sd_bk;
+
+                        // add slowdown change to the global slowdown energy
+                        de_sd_change_interrupt_ += de_sd;
+                        dH_sd_change_interrupt_ += dH_sd;
+                        de_sd_change_cum_ += de_sd;
+                        dH_sd_change_cum_ += dH_sd;
+#endif //SLOWDOWN
+
+#ifdef AR_DEBUG_PRINT
+                        std::cerr<<"Interrupt condition triggered!";
+                        std::cerr<<" Time: "<<time_;
+#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
+                        std::cerr<<" Energy change: dE_SD: "<<de_sd<<" dH_SD: "<<dH_sd;
+                        std::cerr<<" Slowdown: "<<bin_root.slowdown.getSlowDownFactor()<<std::endl;
+#endif
+                        bin_interrupt.adr->printColumnTitle(std::cerr);
+                        std::cerr<<std::endl;
+                        bin_interrupt.adr->printColumn(std::cerr);
+                        std::cerr<<std::endl;
+                        Tparticle::printColumnTitle(std::cerr);
+                        std::cerr<<std::endl;
+                        for (int j=0; j<2; j++) {
+                            bin_interrupt.adr->getMember(j)->printColumn(std::cerr);
+                            std::cerr<<std::endl;
+                        }
+#endif
+
+                        // change fix step option to make safety if energy change is large
+                        //info.fix_step_option=FixStepOption::none;
+                        
+                        // if time_end flag set, reset it to be safety
+                        //time_end_flag = false;
+
+                        // check merger case
+                        if (bin_interrupt.status==InterruptStatus::merge) {
+                            // count particle having mass
+                            int count_mass=0;
+                            int index_mass_last=-1;
+                            for (int j=0; j<n_particle; j++) {
+                                if (particles[j].mass>0.0) {
+                                    count_mass++;
+                                    index_mass_last=j;
+                                }
+                            }
+                            // only one particle has mass, drift directly
+                            if (count_mass==1) {
+                                ASSERT(index_mass_last<n_particle&&index_mass_last>=0);
+                                auto& p = particles[index_mass_last];
+                                Float dt = _time_end - time_;
+                                p.pos[0] += dt * p.vel[0];
+                                p.pos[1] += dt * p.vel[1];
+                                p.pos[2] += dt * p.vel[2];
+
+                                time_ += dt;
+
+                                return CheckpointAction::abandon;
+                            }
+                            // if only two particles have mass, switch off auto ds adjustment
+                            if (count_mass==2) {
+                                info.fix_step_option=FixStepOption::later;
+                                _checkpoint.setStepOption(info.fix_step_option);
+                            }
+                            //else {
+                            //    info.generateBinaryTree(particles, G);
+                            //}
+                        }
+
+#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
+                        updateSlowDownAndCorrectEnergy(true, true);
+#endif
+
+                        restartRegularizationStep(_checkpoint, RestartCause::interrupt, info.calcDsKeplerBinaryTree(*bin_interrupt.adr, manager->step.getOrder(), G, manager->ds_scale));
+
+                        // return one should be the top root
+                        if (bin_interrupt_return.status!=InterruptStatus::none) {
+                            if (bin_interrupt_return.adr!= bin_interrupt.adr) {
+                                // give root address if interrupted binaries are different from previous one
+                                bin_interrupt_return.adr = &(info.getBinaryTreeRoot());
+                            }
+                            if (bin_interrupt.status==InterruptStatus::merge) 
+                                bin_interrupt_return.status = InterruptStatus::merge;
+                        }
+                        else bin_interrupt_return = bin_interrupt;
+                    }
+                    bin_interrupt.clear();
+                }
+            }
+
+
+            // update binary orbit and ds if unstable
+            if (!_checkpoint.isSynchronizing()&&!binary_update_flag) {
+                bool update_flag=updateBinarySemiEccPeriodIter(bin_root, G, time_);
+
+#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
+                updateSlowDownAndCorrectEnergy(true, true);
+#endif
+
+                if (update_flag) {
+            // update slowdown and correct slowdown energy and gt_inv
+
+#ifdef AR_DEBUG_PRINT
+                    std::cerr<<"Update binary tree orbits, time= "<<time_<<"\n";
+#endif
+                    restartRegularizationStep(_checkpoint, RestartCause::binary_update, info.calcDsKeplerBinaryTree(bin_root, manager->step.getOrder(), G, manager->ds_scale));
+                }
+            }
+
+            // in case the step option is changed above
+            _checkpoint.setStepOption(info.fix_step_option);
+
+            return CheckpointAction::proceed;
+        }
+
+        //! one step of integrateToTime
+        /*! 
+          \return the integration error (change of the extended Hamiltonian) and the sub-step time table
+         */
+        StepOutcome stepToTime(const Float _ds, IntegrateToTimeData& _data) {
+            // integrate one step
+            if(_data.n_particle==2) integrateTwoOneStep(_ds, _data.time_table);
+            else integrateOneStep(_ds, _data.time_table);
+
+            // energy check
+#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
+            Float energy_error_bk = getEnergyErrorSlowDownFromBackup(_data.backup_data);
+            Float etot_ref_bk = getEtotSlowDownRefFromBackup(_data.backup_data);
+            Float energy_error = getEnergyErrorSlowDown();
+            Float H_bk = getHSlowDownFromBackup(_data.backup_data);
+            Float H = getHSlowDown();
+#else
+            Float energy_error_bk = getEnergyErrorFromBackup(_data.backup_data);
+            Float etot_ref_bk = getEtotRefFromBackup(_data.backup_data);
+            Float energy_error = getEnergyError();
+            Float H_bk = getHFromBackup(_data.backup_data);
+            Float H = getH();
+#endif
+            _data.energy_error = energy_error;
+            _data.energy_error_bk = energy_error_bk;
+            _data.etot_ref_bk = etot_ref_bk;
+            _data.H = H;
+
+            // get integration error for extended Hamiltonian
+            Float integration_error_rel_abs = abs(H-H_bk);
+
+            return StepOutcome{integration_error_rel_abs, _data.time_table};
+        }
+
+        //! error message print of integrateToTime for the last step
+        void printMessageToTime(const char* message, const StepReport& report, const IntegrateToTimeData& _data) {
+            std::cerr<<message<<std::endl;
+            std::cerr<<"  T: "<<time_
+                     <<"  dT_err/T: "<<(_data.time_end - time_)/_data.dt_full
+                     <<"  ds: "<<report.ds
+                     <<"  ds_init: "<<report.ds_init
+                     <<"  |Int_err/E|: "<<report.integration_error
+                     <<"  |Int_err_cum/E|: "<<_data.getIntegrationErrorCumAbs()
+                     <<"  |dE/E|: "<<_data.getEnergyErrorRelAbs()
+                     <<"  dE_cum: "<<_data.energy_error
+                     <<"  Etot_sd: "<<_data.etot_ref_bk
+                     <<"  T_end_flag: "<<report.synchronizing
+                     <<"  Step_count: "<<report.step_count;
+            switch (report.fix_step_option) {
+            case FixStepOption::always:
+                std::cerr<<"  Fix:  always"<<std::endl;
+                break;
+            case FixStepOption::later:
+                std::cerr<<"  Fix:  later"<<std::endl;
+                break;
+            case FixStepOption::none:
+                std::cerr<<"  Fix:  none"<<std::endl;
+                break;
+            default:
+                break;
+            }
+        }
+
+#ifdef AR_COLLECT_DS_MODIFY_INFO
+        void collectDsModifyInfo(const char* error_message, const StepReport& _report, const IntegrateToTimeData& _data) {
+            std::cerr<<error_message<<": "
+                     <<"time "<<time_<<" " 
+                     <<"ds_new "<<_report.ds_next<<" "
+                     <<"ds_init "<<_report.ds_init<<" "
+                     <<"modify "<<_report.step_modify_factor<<" "
+                     <<"steps "<<_report.step_count<<" "
+                     <<"n_mods "<<_report.reduce_count<<" "
+                     <<"err "<<_report.integration_error<<" "
+                     <<"err/max "<<1.0/_report.integration_error_ratio<<" "
+                     <<"errcum/E "<<_data.getIntegrationErrorCumAbs()<<" "
+                     <<"dt "<<_report.dt<<" "
+                     <<"n_ptcl "<<_data.n_particle<<" ";
+            for (int i=0; i<info.binarytree.getSize(); i++) {
+                auto& bini = info.binarytree[i];
+                std::cerr<<"semi "<<bini.semi<<" "
+                         <<"ecc "<<bini.ecc<<" "
+                         <<"period "<<bini.period<<" "
+                         <<"m1 "<<bini.m1<<" "
+                         <<"m2 "<<bini.m2<<" "
+                         <<"stab "<<bini.stab<<" "
+                         <<"sd "<<bini.slowdown.getSlowDownFactor()<<" "
+                         <<"sd_org "<<bini.slowdown.getSlowDownFactorOrigin()<<" "
+                         <<"pert_in "<<bini.slowdown.getPertIn()<<" "
+                         <<"pert_out "<<bini.slowdown.getPertOut()<<" ";
+            }
+            std::cerr<<std::endl;
+        }
+#endif 
+
+        //! per-step report of integrateToTime: all warning and debug printing
+        void observeToTime(const StepReport& _report, IntegrateToTimeData& _data) {
+            switch (_report.event) {
+            case StepEvent::step_taken:
+//#ifdef AR_WARN
+                // warning for large number of steps
+                if(_data.warning_print_once&&_report.step_count>=manager->step_count_max) {
+                    if(_report.step_count%manager->step_count_max==0) {
+                        printMessageToTime("Warning: step count is signficiant large", _report, _data);
+                        for (int i=0; i<info.binarytree.getSize(); i++){
+                            auto& bin = info.binarytree[i];
+                            std::cerr<<"  Binary["<<i<<"]: "
+                                     <<"  i1="<<bin.getMemberIndex(0)
+                                     <<"  i2="<<bin.getMemberIndex(1)
+                                     <<"  m1="<<bin.m1
+                                     <<"  m2="<<bin.m2
+                                     <<"  semi= "<<bin.semi
+                                     <<"  ecc= "<<bin.ecc
+                                     <<"  period= "<<bin.period
+                                     <<"  stab= "<<bin.stab
+                                     <<"  SD= "<<bin.slowdown.getSlowDownFactor()
+                                     <<"  SD_org= "<<bin.slowdown.getSlowDownFactorOrigin()
+                                     <<"  Tscale= "<<bin.slowdown.timescale
+                                     <<"  pert_in= "<<bin.slowdown.pert_in
+                                     <<"  pert_out= "<<bin.slowdown.pert_out;
+                            std::cerr<<std::endl;
+                            _data.warning_print_once = false;
+                        }
+#ifdef AR_DEBUG_DUMP
+                        if (!info.dump_flag) {
+                            DATADUMP("dump_large_step");
+                            info.dump_flag=true;
+                        }
+#endif
+                    }
+                }
+//#endif
+
+#ifdef AR_DEEP_DEBUG
+                printMessageToTime("", _report, _data);
+                std::cerr<<"Timetable: ";
+                for (int i=0; i<manager->step.getCDPairSize(); i++) std::cerr<<" "<<_data.time_table[manager->step.getSortCumSumCKIndex(i)];
+                std::cerr<<std::endl;
+#endif
+                break;
+            case StepEvent::large_energy_error:
+#ifdef AR_COLLECT_DS_MODIFY_INFO
+                collectDsModifyInfo("Large_energy_error", _report, _data);
+#endif
+                break;
+            case StepEvent::negative_step:
+#ifdef AR_COLLECT_DS_MODIFY_INFO
+                collectDsModifyInfo("Negative_step", _report, _data);
+#endif
+                break;
+            case StepEvent::reuse_backup_step:
+#ifdef AR_COLLECT_DS_MODIFY_INFO
+                collectDsModifyInfo("Reuse_backup_ds", _report, _data);
+#endif
+                break;
+            case StepEvent::increase_step:
+                // the persistent Regularization step follows the growth
+                info.ds = _report.ds_next;
+#ifdef AR_DEBUG_PRINT
+                std::cerr<<"Energy error is small enough for increase step, integration_error_rel_abs="<<_report.integration_error
+                         <<" energy_error_rel_max="<<manager->energy_error_relative_max<<" step_modify_factor="<<_report.step_modify_factor<<" new ds="<<_report.ds_next<<std::endl;
+#endif
+                break;
+            case StepEvent::sync_enlarge_step:
+#ifdef AR_DEEP_DEBUG
+                std::cerr<<"Time step dt(real) "<<_report.dt<<" <0.3*(time_end-time)(real) "<<_data.time_end - time_<<" enlarge step factor: "<<_report.step_modify_factor<<" new ds: "<<_report.ds_next<<std::endl;
+#endif
+                break;
+            case StepEvent::sync_overshoot_first:
+#ifdef AR_DEEP_DEBUG
+                std::cerr<<"Time_end reach, time[k]= "<<_report.time_next<<" time= "<<time_<<" time_end/time[k]="<<_data.time_end/_report.time_next<<" CumSum_CK="<<_report.cck<<" ds(next) = "<<_report.ds<<" ds(next_next) = "<<_report.ds_next<<"\n";
+#endif
+                break;
+            case StepEvent::sync_overshoot_between:
+#ifdef AR_DEEP_DEBUG
+                std::cerr<<"Time_end reach, time_prev= "<<_report.time_prev<<" time[k]= "<<_report.time_next<<" time= "<<time_<<" (time_end-time_prev)/dt="<<(_data.time_end-_report.time_prev)/_report.dt<<" CumSum_CK="<<_report.cck<<" CumSum_CK(prev)="<<_report.cck_prev<<" ds(next) = "<<_report.ds<<" ds(next_next) = "<<_report.ds_next<<" \n";
+#endif
+                break;
+            case StepEvent::synchronization_failed:
+                // When time sychronization steps too large, the integration is aborted
+                printMessageToTime("Error! step count after time synchronization is too large", _report, _data);
+                printColumnTitle(std::cerr,20,info.binarytree.getSize());
+                std::cerr<<std::endl;
+                printColumn(std::cerr,20,info.binarytree.getSize());
+                std::cerr<<std::endl;
+                break;
+            case StepEvent::finish:
+#ifdef AR_DEEP_DEBUG
+                std::cerr<<"Finish, time_diff_rel = "<<(_data.time_end - time_)/_data.dt_full<<" integration_error_rel_abs = "<<_report.integration_error<<std::endl;
+#endif
+                break;
+            }
+        }
+
+    public:
         // Integrate the system to a given time
-        /*!
+        /*! The Regularization step of every step is chosen by RegularizationStepControl, which drives the integration through ToTimeStepper
           @param[in] _time_end: the expected finishing time without offset
           \return binary tree of the pair which triggers interruption condition
          */
         InterruptBinary<Tparticle> integrateToTime(const Float _time_end) {
             ASSERT(checkParams());
-
-            // real full time step
-            const Float dt_full = _time_end - time_;
-
-            // time error 
-            const Float time_error = manager->time_error_max;
-
-            // energy error limit
-            const Float energy_error_rel_max = manager->energy_error_relative_max;
-            // expect energy_error using half step if energy_error_rel_max reached
-            //const Float energy_error_rel_max_half_step = energy_error_rel_max * manager->step.calcErrorRatioFromStepModifyFactor(0.5);
-            //const Float dt_min = manager->time_step_min;
 
             // backup data size
             const int bk_data_size = getBackupDataSize();
@@ -1987,101 +2447,29 @@ namespace AR {
 #ifdef AR_DEBUG_DUMP
             Float backup_data_init[bk_data_size]; // for backup initial data
 #endif
-            bool backup_flag=true; // flag for backup or restore
 
             // time table
             const int cd_pair_size = manager->step.getCDPairSize();
             Float time_table[cd_pair_size]; // for storing sub-integrated time 
 
-            // two switch step control
-            Float ds[2] = {info.ds,info.ds}; // step with a buffer
-            Float ds_init   = info.ds;  //backup initial step
-            int   ds_switch=0;   // 0 or 1
+            // Regularization step control, starting from the persistent step
+            const StepControlLimits step_limits = {manager->time_error_max, manager->energy_error_relative_max, manager->step_count_max};
+            RegularizationStepControl step_control(manager->step, step_limits, info.ds, info.fix_step_option);
 
-            // reduce ds control, three level
-            const int n_reduce_level_max=10;
-
-            struct DsBackupManager{
-                Float ds_backup[n_reduce_level_max+1];
-                int n_step_wait_recover_ds[n_reduce_level_max+1];
-                int n_reduce_level; 
-
-                DsBackupManager(const Float _ds) { initial(_ds), n_reduce_level = -1; }
-
-                void initial(const Float _ds) {
-                    for (int i=0; i<n_reduce_level_max; i++) {
-                        ds_backup[i] = _ds;
-                        n_step_wait_recover_ds[i] = 0;
-                    }
-                }
-
-                // shift backup by one level, if successful, return true
-                bool shiftReduceLevel() {
-                    if (n_reduce_level>0) {
-                        for (int i=0; i<n_reduce_level-1; i++) {
-                            ds_backup[i] =ds_backup[i+1];
-                            n_step_wait_recover_ds[i] = n_step_wait_recover_ds[i+1];
-                        }
-                        n_reduce_level--;
-                        return true;
-                    }
-                    return false;
-                }
-
-                // record ds to backup
-                void backup(const Float _ds, const Float _modify_factor) {
-                    //if (n_reduce_level==n_reduce_level_max) shiftReduceLevel();  // not converse sometimes, becomes infinite small steps
-                    if (n_reduce_level==n_reduce_level_max) 
-                        n_step_wait_recover_ds[n_reduce_level] += 2*to_int(1.0/_modify_factor);
-                    else {
-                        n_reduce_level++;
-                        ds_backup[n_reduce_level] = _ds;
-                        n_step_wait_recover_ds[n_reduce_level] = 2*to_int(1.0/_modify_factor);
-                    }
-                }
-
-                // count step (return false) and recover ds if necessary (return true)
-                bool countAndRecover(Float &_ds, Float &_modify_factor, const bool _recover_flag) {
-                    if (n_reduce_level>=0) {
-                        if (n_step_wait_recover_ds[n_reduce_level] ==0) {
-                            if (_recover_flag) {
-                                _modify_factor = ds_backup[n_reduce_level]/_ds;
-                                _ds = ds_backup[n_reduce_level];
-                                n_step_wait_recover_ds[n_reduce_level] = -1;
-                                n_reduce_level--;
-                                return true;
-                            }
-                        }
-                        else {
-                            n_step_wait_recover_ds[n_reduce_level]--;
-                            return false;
-                        }
-                    }
-                    return false;
-                }
-
-            } ds_backup(info.ds);
-
-            int reduce_ds_count=0; // number of reduce ds (ignore first few steps)
-            Float step_modify_factor=1.0; // step modify factor 
-            Float previous_step_modify_factor=1.0; // step modify factor 
-            Float previous_error_ratio=-1; // previous error ratio when ds is reduced
-            bool previous_is_restore=false; // previous step is reduced or not
-
-            // time end control
-            int n_step_end=0;  // number of steps integrated to reach the time end for one during the time sychronization sub steps
-            bool time_end_flag=false; // indicate whether time reach the end
-
-            // step count
-            long long unsigned int step_count=0; // integration step 
-            long long unsigned int step_count_tsyn=0; // time synchronization step
-            InterruptBinary<Tparticle> bin_interrupt;
-            bin_interrupt.time_now=time_ + info.time_offset;
-            bin_interrupt.time_end=_time_end + info.time_offset;
-            InterruptBinary<Tparticle> bin_interrupt_return = bin_interrupt;
+            IntegrateToTimeData data;
+            data.time_end = _time_end;
+            data.dt_full = _time_end - time_; // real full time step
+            data.backup_data = backup_data;
+            data.bk_data_size = bk_data_size;
+            data.time_table = time_table;
+            data.bin_interrupt.time_now=time_ + info.time_offset;
+            data.bin_interrupt.time_end=_time_end + info.time_offset;
+            data.bin_interrupt_return = data.bin_interrupt;
+            data.warning_print_once = true;
             
             // particle data
             const int n_particle = particles.getSize();
+            data.n_particle = n_particle;
 
 /* This must suppress since after findslowdowninner, slowdown inner is reset to 1.0, recalculate ekin_sdi give completely wrong value for energy correction for slowdown change later
 #ifdef AR_DEBUG
@@ -2091,9 +2479,6 @@ namespace AR {
             ekin_ = ekin_check;
 #endif
 */
-            // warning print flag
-            bool warning_print_once=true;
-
 #ifdef AR_DEBUG_DUMP
             // back up initial data
             backupIntData(backup_data_init);
@@ -2127,797 +2512,35 @@ namespace AR {
             for (int i=0; i<info.binarytree.getSize(); i++)
                 info.binarytree[i].stab_check_time = time_;
 
-#ifdef AR_STEP_TRACE
-            StepTrace step_trace;
-            step_trace.ds_persist = info.ds;
-            if (step_trace.file!=NULL)
-                fprintf(step_trace.file, "BEGIN %a %d %a %a %a %a %llu %d %d\n", (double)info.ds, (int)info.fix_step_option, (double)time_, (double)_time_end,
-                        (double)time_error, (double)energy_error_rel_max, manager->step_count_max, manager->step.getOrder(), cd_pair_size);
-#endif
 
-            // integration loop
-            while(true) {
-#ifdef AR_STEP_TRACE
-                step_trace.persist(info.ds);
-#endif
-                // backup data
-                bool binary_update_flag=false;
-                auto& bin_root = info.getBinaryTreeRoot();
-                auto& G = manager->interaction.gravitational_constant;
-                
-                if(backup_flag) {
-#ifdef AR_STEP_TRACE
-                    if (step_trace.file!=NULL) fprintf(step_trace.file, "C\n");
-#endif
-                    // check interrupt condiction, ensure that time end not reach
-                    if (manager->interrupt_detection_option>0 && !time_end_flag) {
-                        bin_interrupt.time_now = time_ + info.time_offset;
-                        bin_interrupt.time_end = _time_end + info.time_offset;
-                        // calc perturbation energy
-                        //Float epert=0.0;
-                        //for (int i=0; i<n_particle; i++) {
-                        //    epert += force_[i].pot_pert*particles[i].mass;
-                        //}
-                        manager->interaction.modifyAndInterruptIter(bin_interrupt, bin_root);
-                        //InterruptBinary<Tparticle>* bin_intr_ptr = &bin_interrupt;
-                        //bin_intr_ptr = bin_root.processRootIter(bin_intr_ptr, Tmethod::modifyAndInterruptIter);
-                        ASSERT(bin_interrupt.checkParams());
-                        if (bin_interrupt.status!=InterruptStatus::none) {
-                            // the mode return back to the root scope
-                            if (manager->interrupt_detection_option==2) {
-                                // cumulative step count 
-                                profile.step_count = step_count;
-                                profile.step_count_tsyn = step_count_tsyn;
-                                profile.step_count_sum += step_count;
-                                profile.step_count_tsyn_sum += step_count_tsyn;
+            ToTimeStepper stepper = {*this, data};
+            StepControlStatus status = step_control.advanceTo(stepper, _time_end);
 
-#ifdef AR_STEP_TRACE
-                                if (step_trace.file!=NULL) fprintf(step_trace.file, "X\n");
-                                step_trace.end("stop", info.ds, (int)info.fix_step_option, step_count, step_count_tsyn);
-#endif
-                                return bin_interrupt;
-                            }
-                            else {
+            // the persistent Regularization step and the step option return to the group information on every exit
+            info.ds = step_control.getPersistentStep();
+            info.fix_step_option = step_control.getStepOption();
 
-                                // check whether destroy appears (all masses becomes zero)
-                                if (bin_interrupt.status==InterruptStatus::destroy) {
-                                    // all particles become zero masses
-#ifdef AR_DEBUG
-                                    for (int j=0; j<n_particle; j++) {
-                                        ASSERT(particles[j].mass==0.0);
-                                    }
-#endif
-                                    de_change_interrupt_ -= etot_ref_;
-                                    dH_change_interrupt_ -= getH();
-                                    ekin_ = epot_ = etot_ref_ = 0.0;
-#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
-                                    de_sd_change_cum_ -= etot_sd_ref_;
-                                    dH_sd_change_interrupt_ -= getHSlowDown();
-                                    ekin_sd_ = epot_sd_ = etot_sd_ref_ = 0.0;
-#endif                                    
-#ifdef AR_DEBUG_PRINT
-                                    std::cerr<<"Interrupt condition triggered! Destroy";
-                                    std::cerr<<" Time: "<<time_;
-                                    bin_interrupt.adr->printColumnTitle(std::cerr);
-                                    std::cerr<<std::endl;
-                                    bin_interrupt.adr->printColumn(std::cerr);
-                                    std::cerr<<std::endl;
-                                    Tparticle::printColumnTitle(std::cerr);
-                                    std::cerr<<std::endl;
-                                    for (int j=0; j<2; j++) {
-                                        bin_interrupt.adr->getMember(j)->printColumn(std::cerr);
-                                        std::cerr<<std::endl;
-                                    }
-#endif
-
-                                    // set binary tree mass to zero
-                                    setBinaryCMZeroIter(bin_root);
-
-                                    // cumulative step count 
-                                    profile.step_count = step_count;
-                                    profile.step_count_tsyn = step_count_tsyn;
-                                    profile.step_count_sum += step_count;
-                                    profile.step_count_tsyn_sum += step_count_tsyn;
-
-                                    Float dt = _time_end - time_;
-                                    time_ += dt;
-
-#ifdef AR_STEP_TRACE
-                                    if (step_trace.file!=NULL) fprintf(step_trace.file, "X\n");
-                                    step_trace.end("stop", info.ds, (int)info.fix_step_option, step_count, step_count_tsyn);
-#endif
-                                    return bin_interrupt;
-                                }
-
-                                Float ekin_bk = ekin_;
-                                Float epot_bk = epot_;
-                                Float H_bk = getH();
-
-#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
-                                Float ekin_sd_bk = ekin_sd_;
-                                Float epot_sd_bk = epot_sd_;
-                                Float H_sd_bk = getHSlowDown();
-#endif
-                                
-                                // update binary tree mass
-                                info.generateBinaryTree(particles, G);
-                                //updateBinaryCMIter(bin_root);
-                                //updateBinarySemiEccPeriodIter(bin_root, G, time_, true);
-                                binary_update_flag = true;
-                                //bool stable_check=
-                                //if (stable_check) bin_root.stableCheckIter(bin_root, 10000*bin_root.period);
-                                
-                                // should do later, original mass still needed
-                                //particles.cm.mass += bin_interrupt.dm;
-
-#ifdef AR_TTL
-                                Float gt_kick_inv_new = calcAccPotAndGTKickInv();
-                                Float d_gt_kick_inv = gt_kick_inv_new - gt_kick_inv_;
-                                // when the change is large, initialize gt_drift_inv_ to avoid large error
-                                if (fabs(d_gt_kick_inv)/std::max(fabs(gt_kick_inv_),fabs(gt_kick_inv_new)) >1e-3) 
-                                    gt_drift_inv_ = gt_kick_inv_new;
-                                else 
-                                    gt_drift_inv_ += d_gt_kick_inv;
-                                gt_kick_inv_ = gt_kick_inv_new;
-#else
-                                calcAccPotAndGTKickInv();
-#endif
-                                // calculate kinetic energy
-                                calcEKin();
-
-                                // Notice initially etot_ref_ does not include epert. The perturbation effect is accumulated in the integration. Here instance change of mass does not create any work. So no need to add de_pert
-                                // get perturbation energy change due to mass change
-                                //Float epert_new = 0.0;
-                                //for (int i=0; i<n_particle; i++) {
-                                //    epert_new += force_[i].pot_pert*particles[i].mass;
-                                //}
-                                //Float de_pert = epert_new - epert; // notice this is double perturbation potential
-
-                                // get energy change
-                                Float de = (ekin_ - ekin_bk) + (epot_ - epot_bk); //+ de_pert;
-                                etot_ref_ += de;
-                                de_change_interrupt_ += de;
-                                dH_change_interrupt_ += getH() - H_bk;
-
-#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
-                                Float de_sd = (ekin_sd_ - ekin_sd_bk) + (epot_sd_ - epot_sd_bk);// + de_pert;
-                                etot_sd_ref_ += de_sd;
-
-                                Float dH_sd = getHSlowDown() - H_sd_bk;
-
-                                // add slowdown change to the global slowdown energy
-                                de_sd_change_interrupt_ += de_sd;
-                                dH_sd_change_interrupt_ += dH_sd;
-                                de_sd_change_cum_ += de_sd;
-                                dH_sd_change_cum_ += dH_sd;
-#endif //SLOWDOWN
-
-#ifdef AR_DEBUG_PRINT
-                                std::cerr<<"Interrupt condition triggered!";
-                                std::cerr<<" Time: "<<time_;
-#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
-                                std::cerr<<" Energy change: dE_SD: "<<de_sd<<" dH_SD: "<<dH_sd;
-                                std::cerr<<" Slowdown: "<<bin_root.slowdown.getSlowDownFactor()<<std::endl;
-#endif
-                                bin_interrupt.adr->printColumnTitle(std::cerr);
-                                std::cerr<<std::endl;
-                                bin_interrupt.adr->printColumn(std::cerr);
-                                std::cerr<<std::endl;
-                                Tparticle::printColumnTitle(std::cerr);
-                                std::cerr<<std::endl;
-                                for (int j=0; j<2; j++) {
-                                    bin_interrupt.adr->getMember(j)->printColumn(std::cerr);
-                                    std::cerr<<std::endl;
-                                }
-#endif
-
-                                // change fix step option to make safety if energy change is large
-                                //info.fix_step_option=FixStepOption::none;
-                                
-                                // if time_end flag set, reset it to be safety
-                                //time_end_flag = false;
-
-                                // check merger case
-                                if (bin_interrupt.status==InterruptStatus::merge) {
-                                    // count particle having mass
-                                    int count_mass=0;
-                                    int index_mass_last=-1;
-                                    for (int j=0; j<n_particle; j++) {
-                                        if (particles[j].mass>0.0) {
-                                            count_mass++;
-                                            index_mass_last=j;
-                                        }
-                                    }
-                                    // only one particle has mass, drift directly
-                                    if (count_mass==1) {
-                                        ASSERT(index_mass_last<n_particle&&index_mass_last>=0);
-                                        auto& p = particles[index_mass_last];
-                                        Float dt = _time_end - time_;
-                                        p.pos[0] += dt * p.vel[0];
-                                        p.pos[1] += dt * p.vel[1];
-                                        p.pos[2] += dt * p.vel[2];
-
-                                        // cumulative step count 
-                                        profile.step_count = step_count;
-                                        profile.step_count_tsyn = step_count_tsyn;
-                                        profile.step_count_sum += step_count;
-                                        profile.step_count_tsyn_sum += step_count_tsyn;
-
-                                        time_ += dt;
-
-#ifdef AR_STEP_TRACE
-                                        if (step_trace.file!=NULL) fprintf(step_trace.file, "X\n");
-                                        step_trace.end("stop", info.ds, (int)info.fix_step_option, step_count, step_count_tsyn);
-#endif
-                                        return bin_interrupt;
-                                    }
-                                    // if only two particles have mass, switch off auto ds adjustment
-                                    if (count_mass==2) {
-                                        info.fix_step_option=FixStepOption::later;
-#ifdef AR_STEP_TRACE
-                                        if (step_trace.file!=NULL) fprintf(step_trace.file, "O %d\n", (int)info.fix_step_option);
-#endif
-                                    }
-                                    //else {
-                                    //    info.generateBinaryTree(particles, G);
-                                    //}
-                                }
-
-#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
-                                updateSlowDownAndCorrectEnergy(true, true);
-#endif
-
-                                info.ds = info.calcDsKeplerBinaryTree(*bin_interrupt.adr, manager->step.getOrder(), G, manager->ds_scale);
-#ifdef AR_STEP_TRACE
-                                if (step_trace.file!=NULL) fprintf(step_trace.file, "R I %a\n", (double)info.ds);
-#endif
-                                Float ds_max = manager->step.calcStepModifyFactorFromErrorRatio(2.0)*ds_init;
-                                Float ds_min = manager->step.calcStepModifyFactorFromErrorRatio(0.5)*ds_init;
-                                if (info.ds>ds_max || info.ds<ds_min) {
-#ifdef AR_DEBUG_PRINT
-                                    std::cerr<<"Change ds after interruption: ds(init): "<<ds_init<<" ds(new): "<<info.ds<<" ds(now): "<<ds[0]<<std::endl;
-#endif
-                                    ASSERT(info.ds>0);
-                                    ds[0] = std::min(ds[0], info.ds);
-                                    ds[1] = std::min(ds[1], info.ds);
-                                    ds_backup.initial(info.ds);
-                                    ds_init = info.ds;
-                                }
-                                else info.ds = ds_init;
-
-                                // return one should be the top root
-                                if (bin_interrupt_return.status!=InterruptStatus::none) {
-                                    if (bin_interrupt_return.adr!= bin_interrupt.adr) {
-                                        // give root address if interrupted binaries are different from previous one
-                                        bin_interrupt_return.adr = &(info.getBinaryTreeRoot());
-                                    }
-                                    if (bin_interrupt.status==InterruptStatus::merge) 
-                                        bin_interrupt_return.status = InterruptStatus::merge;
-                                }
-                                else bin_interrupt_return = bin_interrupt;
-                            }
-                            bin_interrupt.clear();
-                        }
-                    }
-
-
-                    // update binary orbit and ds if unstable
-                    if (!time_end_flag&&!binary_update_flag) {
-                        bool update_flag=updateBinarySemiEccPeriodIter(bin_root, G, time_);
-
-#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
-                        updateSlowDownAndCorrectEnergy(true, true);
-#endif
-
-                        if (update_flag) {
-                    // update slowdown and correct slowdown energy and gt_inv
-
-#ifdef AR_DEBUG_PRINT
-                            std::cerr<<"Update binary tree orbits, time= "<<time_<<"\n";
-#endif
-                            info.ds = info.calcDsKeplerBinaryTree(bin_root, manager->step.getOrder(), G, manager->ds_scale);
-#ifdef AR_STEP_TRACE
-                            if (step_trace.file!=NULL) fprintf(step_trace.file, "R B %a\n", (double)info.ds);
-#endif
-                            if (abs(ds_init-info.ds)/ds_init>0.1) {
-#ifdef AR_DEBUG_PRINT
-                                std::cerr<<"Change ds after update binary orbit: ds(init): "<<ds_init<<" ds(new): "<<info.ds<<" ds(now): "<<ds[0]<<std::endl;
-#endif
-                                ASSERT(info.ds>0);
-                                ds[0] = std::min(ds[0], info.ds);
-                                ds[1] = std::min(ds[1], info.ds);
-                                ds_backup.initial(info.ds);
-                                ds_init = info.ds;
-                            }
-                        }
-                    }
-
-#ifdef AR_STEP_TRACE
-                    step_trace.persist(info.ds);
-                    if (step_trace.file!=NULL) fprintf(step_trace.file, "S\n");
-#endif
-                    int bk_return_size = backupIntData(backup_data);
-                    ASSERT(bk_return_size == bk_data_size);
-                    (void)bk_return_size;
-
-                }
-                else { //restore data
-#ifdef AR_STEP_TRACE
-                    if (step_trace.file!=NULL) fprintf(step_trace.file, "T\n");
-#endif
-                    int bk_return_size = restoreIntData(backup_data);
-                    ASSERT(bk_return_size == bk_data_size);
-                    (void)bk_return_size;
-//#ifdef AR_SLOWDOWN_ARRAY
-                    // update c.m. of binaries 
-                    // binary c.m. is not backup, thus recalculate to get correct c.m. velocity for position drift correction due to slowdown inner (the first drift in integrateonestep assume c.m. vel is up to date)
-//                    updateCenterOfMassForBinaryWithSlowDownInner();
-//#elif AR_SLOWDOWN_TREE
-                    updateBinaryCMIter(info.getBinaryTreeRoot());
-//#endif
-                }
-
-                // get real time 
-                Float dt = time_;
-
-                // integrate one step
-                ASSERT(!ISINF(ds[ds_switch]));
-                if(n_particle==2) integrateTwoOneStep(ds[ds_switch], time_table);
-                else integrateOneStep(ds[ds_switch], time_table);
-                //info.generateBinaryTree(particles, G);
-
-                // real step size
-                dt =  time_ - dt;
-//                ASSERT(dt>0.0);
-                
-                step_count++;
-
-                // energy check
-#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
-                Float energy_error_bk = getEnergyErrorSlowDownFromBackup(backup_data);
-                Float etot_ref_bk = getEtotSlowDownRefFromBackup(backup_data);
-                Float energy_error = getEnergyErrorSlowDown();
-                Float H_bk = getHSlowDownFromBackup(backup_data);
-                Float H = getHSlowDown();
-#else
-                Float energy_error_bk = getEnergyErrorFromBackup(backup_data);
-                Float etot_ref_bk = getEtotRefFromBackup(backup_data);
-                Float energy_error = getEnergyError();
-                Float H_bk = getHFromBackup(backup_data);
-                Float H = getH();
-#endif
-                Float energy_error_diff = energy_error - energy_error_bk;
-
-                Float energy_error_rel_abs = abs(energy_error_diff/etot_ref_bk);
-
-                // get integration error for extended Hamiltonian
-                Float integration_error_rel_abs = abs(H-H_bk);
-                // H should be zero initially
-                Float integration_error_rel_cum_abs = abs(H);
-
-                Float integration_error_ratio = energy_error_rel_max/integration_error_rel_abs;
-
-#ifdef AR_STEP_TRACE
-                if (step_trace.file!=NULL) {
-                    fprintf(step_trace.file, "P %a %a %a", (double)ds[ds_switch], (double)time_, (double)integration_error_rel_abs);
-                    // the sub-step time table is only read when the step overshoots the time end
-                    if (time_ > _time_end + time_error)
-                        for (int i=0; i<cd_pair_size; i++) fprintf(step_trace.file, " %a", (double)time_table[i]);
-                    fprintf(step_trace.file, "\n");
-                }
-#endif
-      
-                // time error
-                Float time_diff_rel = (_time_end - time_)/dt_full;
-
-                //! regular block time step modification factor
-                auto regularStepFactor = [](const Float _fac) {
-                    Float fac = 1.0;
-                    if (_fac<1) while (fac>_fac) fac *= 0.5;
-                    else {
-                        while (fac<=_fac) fac *= 2.0;
-                        fac *= 0.5;
-                    }
-                    return fac;
-                };
-
-                Float error_increase_ratio_regular = manager->step.calcErrorRatioFromStepModifyFactor(2.0);
-
-                // error message print
-                auto printMessage = [&](const char* message) {
-                    std::cerr<<message<<std::endl;
-                    std::cerr<<"  T: "<<time_
-                             <<"  dT_err/T: "<<time_diff_rel
-                             <<"  ds: "<<ds[ds_switch]
-                             <<"  ds_init: "<<ds_init
-                             <<"  |Int_err/E|: "<<integration_error_rel_abs
-                             <<"  |Int_err_cum/E|: "<<integration_error_rel_cum_abs
-                             <<"  |dE/E|: "<<energy_error_rel_abs
-                             <<"  dE_cum: "<<energy_error
-                             <<"  Etot_sd: "<<etot_ref_bk
-                             <<"  T_end_flag: "<<time_end_flag
-                             <<"  Step_count: "<<step_count;
-                    switch (info.fix_step_option) {
-                    case FixStepOption::always:
-                        std::cerr<<"  Fix:  always"<<std::endl;
-                        break;
-                    case FixStepOption::later:
-                        std::cerr<<"  Fix:  later"<<std::endl;
-                        break;
-                    case FixStepOption::none:
-                        std::cerr<<"  Fix:  none"<<std::endl;
-                        break;
-                    default:
-                        break;
-                    }
-                };
-
-#ifdef AR_COLLECT_DS_MODIFY_INFO
-                auto collectDsModifyInfo = [&](const char* error_message) {
-                    std::cerr<<error_message<<": "
-                             <<"time "<<time_<<" " 
-                             <<"ds_new "<<ds[1-ds_switch]<<" "
-                             <<"ds_init "<<ds_init<<" "
-                             <<"modify "<<step_modify_factor<<" "
-                             <<"steps "<<step_count<<" "
-                             <<"n_mods "<<reduce_ds_count<<" "
-                             <<"err "<<integration_error_rel_abs<<" "
-                             <<"err/max "<<1.0/integration_error_ratio<<" "
-                             <<"errcum/E "<<integration_error_rel_cum_abs<<" "
-                             <<"dt "<<dt<<" "
-                             <<"n_ptcl "<<n_particle<<" ";
-                    for (int i=0; i<info.binarytree.getSize(); i++) {
-                        auto& bini = info.binarytree[i];
-                        std::cerr<<"semi "<<bini.semi<<" "
-                                 <<"ecc "<<bini.ecc<<" "
-                                 <<"period "<<bini.period<<" "
-                                 <<"m1 "<<bini.m1<<" "
-                                 <<"m2 "<<bini.m2<<" "
-                                 <<"stab "<<bini.stab<<" "
-                                 <<"sd "<<bini.slowdown.getSlowDownFactor()<<" "
-                                 <<"sd_org "<<bini.slowdown.getSlowDownFactorOrigin()<<" "
-                                 <<"pert_in "<<bini.slowdown.getPertIn()<<" "
-                                 <<"pert_out "<<bini.slowdown.getPertOut()<<" ";
-                    }
-                    std::cerr<<std::endl;
-                };
-#endif 
-
-//#ifdef AR_WARN
-                // warning for large number of steps
-                if(warning_print_once&&step_count>=manager->step_count_max) {
-                    if(step_count%manager->step_count_max==0) {
-                        printMessage("Warning: step count is signficiant large");
-                        for (int i=0; i<info.binarytree.getSize(); i++){
-                            auto& bin = info.binarytree[i];
-                            std::cerr<<"  Binary["<<i<<"]: "
-                                     <<"  i1="<<bin.getMemberIndex(0)
-                                     <<"  i2="<<bin.getMemberIndex(1)
-                                     <<"  m1="<<bin.m1
-                                     <<"  m2="<<bin.m2
-                                     <<"  semi= "<<bin.semi
-                                     <<"  ecc= "<<bin.ecc
-                                     <<"  period= "<<bin.period
-                                     <<"  stab= "<<bin.stab
-                                     <<"  SD= "<<bin.slowdown.getSlowDownFactor()
-                                     <<"  SD_org= "<<bin.slowdown.getSlowDownFactorOrigin()
-                                     <<"  Tscale= "<<bin.slowdown.timescale
-                                     <<"  pert_in= "<<bin.slowdown.pert_in
-                                     <<"  pert_out= "<<bin.slowdown.pert_out;
-                            std::cerr<<std::endl;
-                            warning_print_once = false;
-                        }
-                        //printColumnTitle(std::cerr,20,info.binarytree.getSize());
-                        //std::cerr<<std::endl;
-                        //printColumn(std::cerr,20,info.binarytree.getSize());
-                        //std::cerr<<std::endl;
+            // When time sychronization steps too large, abort
+            if (status==StepControlStatus::failed_to_synchronize) {
 #ifdef AR_DEBUG_DUMP
-                        if (!info.dump_flag) {
-                            DATADUMP("dump_large_step");
-                            info.dump_flag=true;
-                        }
-#endif
-
-//                        // increase step size if energy error is small, not works correctly, suppress
-//                        if(integration_error_rel_abs<energy_error_rel_max) {
-//                            Float integration_error_ratio = energy_error_rel_max/integration_error_rel_abs;
-//                            Float step_modify_factor = manager->step.calcStepModifyFactorFromErrorRatio(integration_error_ratio);
-//                            ASSERT(step_modify_factor>0.0);
-//                            ds[ds_switch] *= step_modify_factor;
-//                            info.ds = ds[ds_switch];
-//                            ds[1-ds_switch] = ds[ds_switch];
-//                            ds_backup.initial(info.ds);
-//                            ds_init = info.ds;
-//                            ASSERT(!ISINF(ds[ds_switch]));
-//#ifdef AR_DEBUG_PRINT
-//                            std::cerr<<"Energy error is small enough for increase step, integration_error_rel_abs="<<integration_error_rel_abs
-//                                     <<" energy_error_rel_max="<<energy_error_rel_max<<" step_modify_factor="<<step_modify_factor<<" new ds="<<ds[1-ds_switch]<<std::endl;
-//#endif
-//                        }
-                    }
+                if (!info.dump_flag) {
+                    DATADUMP("dump_large_step");
+                    info.dump_flag=true;
                 }
-//#endif
-          
-                // When time sychronization steps too large, abort
-                if(step_count_tsyn>manager->step_count_max) {
-                    printMessage("Error! step count after time synchronization is too large");
-                    printColumnTitle(std::cerr,20,info.binarytree.getSize());
-                    std::cerr<<std::endl;
-                    printColumn(std::cerr,20,info.binarytree.getSize());
-                    std::cerr<<std::endl;
-//                    restoreIntData(backup_data_init);
-#ifdef AR_DEBUG_DUMP
-                    if (!info.dump_flag) {
-                        DATADUMP("dump_large_step");
-                        info.dump_flag=true;
-                    }
 #endif
-                    abort();
-                }
-
-
-#ifdef AR_DEEP_DEBUG
-                printMessage("");
-                std::cerr<<"Timetable: ";
-                for (int i=0; i<cd_pair_size; i++) std::cerr<<" "<<time_table[manager->step.getSortCumSumCKIndex(i)];
-                std::cerr<<std::endl;
-#endif
-
-                ASSERT(!ISNAN(integration_error_rel_abs));
-
-                // modify step if energy error is large
-                if(integration_error_rel_abs>energy_error_rel_max && info.fix_step_option!=FixStepOption::always) {
-
-                    bool check_flag = true;
-
-                    // check whether already modified
-                    if (previous_step_modify_factor!=1.0) {
-                        ASSERT(previous_error_ratio>0.0);
-
-                        // if error does not reduce much, do not modify step anymore
-                        if (integration_error_ratio>0.5*previous_error_ratio) check_flag=false;
-                    }
-
-                    if (check_flag) {
-                        // for initial steps, reduce step permanently 
-                        if(step_count<5) {
-
-                            // estimate the modification factor based on the symplectic order
-                            // limit step_modify_factor to 0.125
-                            step_modify_factor = std::max(regularStepFactor(manager->step.calcStepModifyFactorFromErrorRatio(integration_error_ratio)), Float(0.125));
-                            ASSERT(step_modify_factor>0.0);
-
-                            previous_step_modify_factor = step_modify_factor;
-                            previous_error_ratio = integration_error_ratio;
-
-                            ds[ds_switch] *= step_modify_factor;
-                            ds[1-ds_switch] = ds[ds_switch];
-                            // permanently reduce ds
-                            // info.ds = ds[ds_switch];
-                            // ASSERT(!ISINF(info.ds));
-                            ds_backup.initial(info.ds);
-
-                            backup_flag = false;
-#ifdef AR_COLLECT_DS_MODIFY_INFO
-                            collectDsModifyInfo("Large_energy_error");
-#endif
-                            continue;
-                        }
-                        // for big energy error, reduce step temparely
-                        else if (info.fix_step_option==FixStepOption::none) {
-
-                            // estimate the modification factor based on the symplectic order
-                            // limit step_modify_factor to 0.125
-                            step_modify_factor = std::max(regularStepFactor(manager->step.calcStepModifyFactorFromErrorRatio(integration_error_ratio)), Float(0.125));
-                            ASSERT(step_modify_factor>0.0);
-
-                            previous_step_modify_factor = step_modify_factor;
-                            previous_error_ratio = integration_error_ratio;
-
-                            ds_backup.backup(ds[ds_switch], step_modify_factor);
-                            if(previous_is_restore) reduce_ds_count++;
-
-                            ds[ds_switch] *= step_modify_factor;
-                            ds[1-ds_switch] = ds[ds_switch];
-                            ASSERT(!ISINF(ds[ds_switch]));
-
-                            // if multiple times reduction happens, permanently reduce ds
-                            //if (reduce_ds_count>3) {
-                            //    bool shift_flag = ds_backup.shiftReduceLevel();
-                            //    if (!shift_flag) ds_backup.initial(ds[ds_switch]);
-                            //    info.ds = ds_backup.ds_backup[0];
-                            //    reduce_ds_count=0;
-                            //}
-
-                            backup_flag = false;
-#ifdef AR_COLLECT_DS_MODIFY_INFO
-                            collectDsModifyInfo("Large_energy_error");
-#endif
-                            continue;
-                        }
-                    }
-                }
-// too much output
-//#ifdef AR_WARN
-//                if(integration_error_rel_abs>100.0*energy_error_rel_max) {
-//                    std::cerr<<"Warning: symplectic integrator error > 100*criterion:"<<integration_error_rel_abs<<std::endl;
-//                }
-//#endif
-
-                // if negative step, reduce step size
-                if(!time_end_flag&&dt<0) {
-                    // limit step_modify_factor to 0.125
-                    step_modify_factor = std::min(std::max(regularStepFactor(manager->step.calcStepModifyFactorFromErrorRatio(abs(_time_end/dt))), Float(0.0625)),Float(0.5)); 
-                    ASSERT(step_modify_factor>0.0);
-                    previous_step_modify_factor = step_modify_factor;
-                    previous_error_ratio = integration_error_ratio;
-
-                    ds[ds_switch] *= step_modify_factor;
-                    ds[1-ds_switch] = ds[ds_switch];
-                    ASSERT(!ISINF(ds[ds_switch]));
-
-                    // for initial steps, reduce step permanently
-                    if (step_count<5) {
-                        //info.ds = ds[ds_switch];
-                        ds_backup.initial(info.ds);
-                    }
-                    else { // reduce step temparely
-                        ds_backup.backup(ds[ds_switch], step_modify_factor);
-                    }
-
-                    backup_flag = false;
-
-#ifdef AR_COLLECT_DS_MODIFY_INFO
-                    collectDsModifyInfo("Negative_step");
-#endif
-                    continue;
-//                    std::cerr<<"Error! symplectic integrated time step ("<<dt<<") < minimum step ("<<dt_min<<")!\n";
-//                    printMessage();
-//#ifdef AR_DEBUG_DUMP
-//                    DATADUMP("dump_negative_time");
-//#endif
-//                    abort();
-                }
-
-                // if no modification, reset previous values
-                previous_step_modify_factor = 1.0;
-                previous_error_ratio = -1.0;
-
-                // check integration time
-                if(time_ < _time_end - time_error){
-                    // step increase depend on n_step_wait_recover_ds
-                    if(info.fix_step_option==FixStepOption::none && !time_end_flag) {
-                        // waiting step count reach
-                        previous_is_restore=ds_backup.countAndRecover(ds[1-ds_switch], step_modify_factor, integration_error_ratio>error_increase_ratio_regular);
-                        if (previous_is_restore) {
-                            //previous_error_ratio = -1;
-                            //previous_step_modify_factor = 1.0;
-#ifdef AR_COLLECT_DS_MODIFY_INFO
-                            collectDsModifyInfo("Reuse_backup_ds");
-#endif
-                        }
-                        // increase step size if energy error is small, not works correctly, integration error may not increase when ds becomes larger, then a very large ds may appear after several iterations. suppress
-                        else if(integration_error_rel_abs<0.5*energy_error_rel_max && dt>0.0 && dt_full/dt>std::max(100.0,0.02*manager->step_count_max)) {
-                            Float integration_error_ratio = energy_error_rel_max/integration_error_rel_abs;
-                            Float step_modify_factor = std::min(Float(100.0),manager->step.calcStepModifyFactorFromErrorRatio(integration_error_ratio));
-                            ASSERT(step_modify_factor>0.0);
-                            ds[1-ds_switch] *= step_modify_factor;
-                            info.ds = ds[1-ds_switch];
-                            ASSERT(!ISINF(ds[1-ds_switch]));
-#ifdef AR_DEBUG_PRINT
-                            std::cerr<<"Energy error is small enough for increase step, integration_error_rel_abs="<<integration_error_rel_abs
-                                     <<" energy_error_rel_max="<<energy_error_rel_max<<" step_modify_factor="<<step_modify_factor<<" new ds="<<ds[1-ds_switch]<<std::endl;
-#endif
-                        }
-                    }
-
-                    // time sychronization on case, when step size too small to reach time end, increase step size
-                    if(time_end_flag && ds[ds_switch]==ds[1-ds_switch]) {
-                        step_count_tsyn++;
-
-                        Float dt_end = _time_end - time_;
-                        if (dt<0) {
-                            // limit step_modify_factor to 0.125
-                            step_modify_factor = std::min(std::max(regularStepFactor(manager->step.calcStepModifyFactorFromErrorRatio(abs(_time_end/dt))), Float(0.0625)),Float(0.5)); 
-                            ASSERT(step_modify_factor>0.0);
-
-                            ds[ds_switch] *= step_modify_factor;
-                            ds[1-ds_switch] = ds[ds_switch];
-                            ASSERT(!ISINF(ds[ds_switch]));
-                        }
-                        else if (n_step_end>1 && dt<0.3*dt_end) {
-                            // dt should be >0.0
-                            // ASSERT(dt>0.0);
-                            ds[1-ds_switch] = ds[ds_switch] * dt_end/dt;
-                            ASSERT(!ISINF(ds[1-ds_switch]));
-#ifdef AR_DEEP_DEBUG
-                            std::cerr<<"Time step dt(real) "<<dt<<" <0.3*(time_end-time)(real) "<<dt_end<<" enlarge step factor: "<<dt_end/dt<<" new ds: "<<ds[1-ds_switch]<<std::endl;
-#endif
-                        }
-                        else n_step_end++;
-                    }
-
-                    // when used once, update to the new step
-                    ds[ds_switch] = ds[1-ds_switch]; 
-                    ASSERT(!ISINF(ds[ds_switch]));
-                    ds_switch = 1-ds_switch;
-
-                    if (dt>0) backup_flag = true;
-                    else backup_flag = false;
-                }
-                else if(time_ > _time_end + time_error) {
-                    time_end_flag = true;
-                    backup_flag = false;
-
-                    step_count_tsyn++;
-                    n_step_end=0;
-
-                    // check timetable
-                    int i=-1,k=0; // i indicate the increasing time index, k is the corresponding index in time_table
-                    for(i=0; i<cd_pair_size; i++) {
-                        k = manager->step.getSortCumSumCKIndex(i);
-                        if(_time_end<time_table[k]) break;
-                    }
-                    if (i==0) { // first step case
-                        ASSERT(time_table[k]>0.0);
-                        ds[ds_switch] *= manager->step.getSortCumSumCK(i)*_time_end/time_table[k];
-                        ds[1-ds_switch] = ds[ds_switch];
-                        ASSERT(!ISINF(ds[ds_switch]));
-#ifdef AR_DEEP_DEBUG
-                        std::cerr<<"Time_end reach, time[k]= "<<time_table[k]<<" time= "<<time_<<" time_end/time[k]="<<_time_end/time_table[k]<<" CumSum_CK="<<manager->step.getSortCumSumCK(i)<<" ds(next) = "<<ds[ds_switch]<<" ds(next_next) = "<<ds[1-ds_switch]<<"\n";
-#endif
-                    }
-                    else { // not first step case, get the interval time 
-                        // previous integrated sub time in time table
-                        Float time_prev = time_table[manager->step.getSortCumSumCKIndex(i-1)];
-                        Float dt_k = time_table[k] - time_prev;
-                        Float ds_tmp = ds[ds_switch];
-                        // get cumsum CK factor for two steps near the time_end
-                        Float cck_prev = manager->step.getSortCumSumCK(i-1);
-                        Float cck = manager->step.getSortCumSumCK(i);
-                        // in case the time is between two sub step, first scale the next step with the previous step CumSum CK cck(i-1)
-                        ASSERT(!ISINF(cck_prev));
-                        ds[ds_switch] *= cck_prev;  
-                        ASSERT(!ISINF(ds[ds_switch]));
-                        // then next next step, scale with the CumSum CK between two step: cck(i) - cck(i-1) 
-                        ASSERT(dt_k>0.0);
-                        ds[1-ds_switch] = ds_tmp*(cck-cck_prev)*std::min(Float(1.0),(_time_end-time_prev+time_error)/dt_k); 
-                        ASSERT(!ISINF(ds[1-ds_switch]));
-
-#ifdef AR_DEEP_DEBUG
-                        std::cerr<<"Time_end reach, time_prev= "<<time_prev<<" time[k]= "<<time_table[k]<<" time= "<<time_<<" (time_end-time_prev)/dt="<<(_time_end-time_prev)/dt<<" CumSum_CK="<<cck<<" CumSum_CK(prev)="<<cck_prev<<" ds(next) = "<<ds[ds_switch]<<" ds(next_next) = "<<ds[1-ds_switch]<<" \n";
-#endif
-                    }
-                }
-                else {
-#ifdef AR_DEEP_DEBUG
-                    std::cerr<<"Finish, time_diff_rel = "<<time_diff_rel<<" integration_error_rel_abs = "<<integration_error_rel_abs<<std::endl;
-#endif
-//#ifdef AR_WARN
-//                    if (integration_error_rel_cum_abs>energy_error_rel_max) {
-//                        std::cerr<<"AR large energy error at the end! ";
-//                        printMessage();
-//#ifdef AR_DEBUG_DUMP
-////                        restoreIntData(backup_data_init);
-//                        DATADUMP("dump_large_error");
-//#endif
-//                    }
-//#endif
-                    break;
-                }
+                abort();
             }
 
-#ifdef AR_STEP_TRACE
-            step_trace.end("reach", info.ds, (int)info.fix_step_option, step_count, step_count_tsyn);
-#endif
-
             // cumulative step count 
-            profile.step_count = step_count;
-            profile.step_count_tsyn = step_count_tsyn;
-            profile.step_count_sum += step_count;
-            profile.step_count_tsyn_sum += step_count_tsyn;
+            profile.step_count = step_control.getStepCount();
+            profile.step_count_tsyn = step_control.getStepCountSync();
+            profile.step_count_sum += step_control.getStepCount();
+            profile.step_count_tsyn_sum += step_control.getStepCountSync();
 
-            return bin_interrupt_return;
+            // an Interrupt that ends the integration early is returned as it is
+            if (status!=StepControlStatus::reached) return data.bin_interrupt;
+
+            return data.bin_interrupt_return;
         }
 
         //! correct CM drift

@@ -45,9 +45,10 @@ namespace AR {
         sync_enlarge_step: during time synchronization the step is too small to reach the target and is enlarged \n
         sync_overshoot_first: the target is passed inside the first sub-step; the step is rejected \n
         sync_overshoot_between: the target is passed between two sub-steps; the step is rejected \n
+        synchronization_failed: the time synchronization steps exceed the maximum step count; the advance ends \n
         finish: the target is reached
      */
-    enum class StepEvent {step_taken, large_energy_error, negative_step, reuse_backup_step, increase_step, sync_enlarge_step, sync_overshoot_first, sync_overshoot_between, finish};
+    enum class StepEvent {step_taken, large_energy_error, negative_step, reuse_backup_step, increase_step, sync_enlarge_step, sync_overshoot_first, sync_overshoot_between, synchronization_failed, finish};
 
     //! Per-step report handed to the stepper, which does all printing
     struct StepReport {
@@ -87,6 +88,9 @@ namespace AR {
 
         //! change the step option 
         void setStepOption(const FixStepOption _option);
+
+        //! persistent Regularization step, after a restart request it holds the outcome
+        Float getPersistentStep() const;
 
         //! reference Regularization step of this advance
         Float getStepInit() const;
@@ -355,7 +359,10 @@ namespace AR {
                 observe(StepEvent::step_taken, step_modify_factor);
 
                 // When time sychronization steps too large, give up
-                if(step_count_tsyn_>limits_.step_count_max) return StepControlStatus::failed_to_synchronize;
+                if(step_count_tsyn_>limits_.step_count_max) {
+                    observe(StepEvent::synchronization_failed, step_modify_factor);
+                    return StepControlStatus::failed_to_synchronize;
+                }
 
                 ASSERT(!ISNAN(integration_error_rel_abs));
 
@@ -563,6 +570,8 @@ namespace AR {
     inline bool StepCheckpoint::requestRestart(const RestartCause _cause, const Float _ds_estimate) { return control_.restart(_cause, _ds_estimate); }
 
     inline void StepCheckpoint::setStepOption(const FixStepOption _option) { control_.fix_step_option_ = _option; }
+
+    inline Float StepCheckpoint::getPersistentStep() const { return control_.ds_persistent_; }
 
     inline Float StepCheckpoint::getStepInit() const { return control_.ds_init_; }
 
