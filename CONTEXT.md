@@ -19,6 +19,9 @@ The logarithmic Hamiltonian variant of **AR**, in which the time transformation 
 **TTL**:
 The variant of **AR** after Mikkola & Aarseth (2002), in which the time transformation during the drift is computed from an auxiliary variable integrated alongside the system instead of from the kinetic energy.
 
+**AR dynamics**:
+The equations of motion as **AR** advances them for one choice of time transformation (**LogH** or **TTL**) and one choice of **Slow-down** scheme (none, **Array slow-down** or **Tree slow-down**).
+
 ### Particles and groups
 
 **Group**:
@@ -47,6 +50,10 @@ _Avoid_: Integration time
 **Regularization time**:
 The fictitious independent variable that replaces **Physical time** in the time-transformed equations of motion; AR advances in steps of it.
 _Avoid_: Step, step size
+
+**Regularization step**:
+The increment of **Regularization time** advanced by one AR step. It names the increment, never the time variable itself.
+_Avoid_: Step size, ds
 
 **Slow-down time**:
 The time by which a slowed-down binary's internal orbit has actually advanced, which is shorter than the elapsed **Physical time** by the **Slow-down factor**.
