@@ -7,7 +7,7 @@ TARGET=unit_test
 
 VPATH=../src
 
-SOURCE=${shell ls ../src/*/*.h} ${shell ls unit/*.h 2>/dev/null}
+SOURCE=${shell ls ../src/*/*.h} ${shell ls unit/*.h 2>/dev/null} ../sample/AR/particle.h ../sample/AR/perturber.h
 TEST_SOURCE=${shell ls unit/*.cxx}
 TEST_OBJECT=$(TEST_SOURCE:.cxx=.o)
 
@@ -16,7 +16,7 @@ CXX= g++
 CXXFLAGS += -O2 -Wall
 
 ## Flag ----------------------------------------------#
-CXXFLAGS += -I../src -I./third_party -I./unit
+CXXFLAGS += -I../src -I./third_party -I./unit -I../sample/AR
 CXXFLAGS += -std=c++20
 CXXFLAGS += -D FIXTURE_DIR='"$(CURDIR)/fixtures"'
 
