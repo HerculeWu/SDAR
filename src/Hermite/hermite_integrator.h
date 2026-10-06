@@ -1756,9 +1756,8 @@ namespace H4{
                             }
                         }
                     }
-#if (!defined AR_SLOWDOWN_ARRAY) && (!defined AR_SLOWDOWN_TREE)
                     // check few-body inner perturbation (suppress when use slowdown inner AR)
-                    else {
+                    else if constexpr (!ARSym::hasSlowDown()) {
                         for (int j=0; j<2; j++) {
                             if (bin_root.isMemberTree(j)) {
                                 auto* bin_sub = bin_root.getMemberAsTree(j);
@@ -1816,7 +1815,6 @@ namespace H4{
                             }
                         }
                     }
-#endif
                 }
             }
         }
@@ -1902,11 +1900,10 @@ namespace H4{
                     }
                     else {
                         const int jg = j-index_offset_group_;
-//#ifndef AR_SLOWDOWN_ARRAY
+//                        // (only without Array slow-down)
 //                        // in case without AR slowdown inner, avoid form AR when inner kappa is >1.0
 //                        Float kappa_org_j = groups[jg].info.getBinaryTreeRoot().slowdown.getSlowDownFactorOrigin();
 //                        if (kappa_org_j>1.0) continue;
-//#endif
                         pj = &groups[jg].particles.cm;
                     }
 
@@ -2010,11 +2007,9 @@ namespace H4{
 
                     auto& pi = groupi.particles.cm;
 
-//#ifndef AR_SLOWDOWN_ARRAY
-//                    // avoid kappa>1.0
+//                    // (only without Array slow-down) avoid kappa>1.0
 //                    Float kappa_org_i = groupi.info.getBinaryTreeRoot().slowdown.getSlowDownFactorOrigin();
 //                    if (kappa_org_i>1.0) continue;
-//#endif
 
                     H4Ptcl* pj;
                     // neighbor is single 
@@ -2024,10 +2019,9 @@ namespace H4{
                     }
                     else {
                         const int jg = j-index_offset_group_;
-//#ifndef AR_SLOWDOWN_ARRAY
+//                        // (only without Array slow-down)
 //                        Float kappa_org_j = groups[jg].getBinaryTreeRoot().slowdown.getSlowDownFactorOrigin();
 //                        if (kappa_org_j>1.0) continue;
-//#endif
 
                         //if (kappa_org_i>1.0&&kappa_org_j>1.0) continue;
                         pj = &groups[jg].particles.cm;
@@ -3091,16 +3085,16 @@ namespace H4{
                  <<std::setw(_width)<<"dE_SD_intr"
                  <<std::setw(_width)<<"dE_SD_mod"
                  <<std::setw(_width)<<"N_SD";
-#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
-            AR::SlowDown sd_empty;
-            int n_sd_count = 0;
-            for (int i=0; i<_n_group; i++) {
-                n_sd_count += _n_sd_list[i];
-                for (int j=0; j<_n_sd_list[i]; j++) 
-                    sd_empty.printColumnTitle(_fout, _width);
+            if constexpr (ARSym::hasSlowDown()) {
+                AR::SlowDown sd_empty;
+                int n_sd_count = 0;
+                for (int i=0; i<_n_group; i++) {
+                    n_sd_count += _n_sd_list[i];
+                    for (int j=0; j<_n_sd_list[i]; j++) 
+                        sd_empty.printColumnTitle(_fout, _width);
+                }
+                ASSERT(_n_sd_tot == n_sd_count);
             }
-            ASSERT(_n_sd_tot == n_sd_count);
-#endif
             perturber.printColumnTitle(_fout, _width);
             info.printColumnTitle(_fout, _width);
             profile.printColumnTitle(_fout, _width);
@@ -3122,33 +3116,25 @@ namespace H4{
             _fout<<std::setw(_width)<<_n_sd_tot;
             AR::SlowDown sd_empty;
             int n_group_now = groups.getSize();
-#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
-            int n_sd_count = 0;
-            for (int i=0; i<_n_group; i++) {
-                n_sd_count += _n_sd_list[i];
-                if (i<n_group_now) {
-                    auto & gi = groups[i];
-#ifdef AR_SLOWDOWN_ARRAY
-                    int n_sd_in = gi.binary_slowdown.getSize();
-                    for (int j=0; j<_n_sd_list[i]; j++) {
-                        if (j<n_sd_in) gi.binary_slowdown[j]->slowdown.printColumn(_fout, _width);
-                        else sd_empty.printColumn(_fout, _width);
+            if constexpr (ARSym::hasSlowDown()) {
+                int n_sd_count = 0;
+                for (int i=0; i<_n_group; i++) {
+                    n_sd_count += _n_sd_list[i];
+                    if (i<n_group_now) {
+                        auto & gi = groups[i];
+                        int n_sd_in = gi.getSlowDownInnerNumber();
+                        for (int j=0; j<_n_sd_list[i]; j++) {
+                            if (j<n_sd_in) gi.getSlowDownInner(j).printColumn(_fout, _width);
+                            else sd_empty.printColumn(_fout, _width);
+                        }
                     }
-#else
-                    int n_sd_in = gi.info.binarytree.getSize();
-                    for (int j=0; j<_n_sd_list[i]; j++) {
-                        if (j<n_sd_in) gi.info.binarytree[j].slowdown.printColumn(_fout, _width);
-                        else sd_empty.printColumn(_fout, _width);
+                    else {
+                        for (int j=0; j<_n_sd_list[i]; j++) sd_empty.printColumn(_fout, _width);
+                        sd_empty.printColumn(_fout, _width);
                     }
-#endif
                 }
-                else {
-                    for (int j=0; j<_n_sd_list[i]; j++) sd_empty.printColumn(_fout, _width);
-                    sd_empty.printColumn(_fout, _width);
-                }
+                ASSERT(_n_sd_tot == n_sd_count);
             }
-            ASSERT(_n_sd_tot == n_sd_count);
-#endif
             perturber.printColumn(_fout, _width);
             info.printColumn(_fout, _width);
             profile.printColumn(_fout, _width);

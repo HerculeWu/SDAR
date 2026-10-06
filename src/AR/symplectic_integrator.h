@@ -12,6 +12,7 @@
 #include "AR/interrupt.h"
 #include "AR/variant.h"
 #include "AR/ar_dynamics.h"
+#include "AR/interaction_concept.h"
 
 //! Algorithmic regularization (time transformed explicit symplectic integrator) namespace
 /*!
@@ -21,17 +22,10 @@ namespace AR {
 
     //! print features
     void printFeatures(std::ostream & fout) {
-#ifdef AR_TTL
-        fout<<"Use AR TTL method\n";
-#else
-        fout<<"Use AR LogH method\n";
-#endif
-#ifdef AR_SLOWDOWN_TREE
-        fout<<"Use slowdown Tree method\n";
-#endif
-#ifdef AR_SLOWDOWN_ARRAY
-        fout<<"Use slowdown array method\n";
-#endif
+        if (std::same_as<DefaultTimeTransformation, TTL>) fout<<"Use AR TTL method\n";
+        else fout<<"Use AR LogH method\n";
+        if (std::same_as<DefaultSlowDownScheme, TreeSlowDown>) fout<<"Use slowdown Tree method\n";
+        if (std::same_as<DefaultSlowDownScheme, ArraySlowDown>) fout<<"Use slowdown array method\n";
 #ifdef AR_SLOWDOWN_TIMESCALE
         fout<<"Use slowdown timescale criterion\n";         
 #endif
@@ -184,6 +178,10 @@ namespace AR {
         static constexpr bool is_slowdown_tree = std::same_as<Tslowdown, TreeSlowDown>;
         static constexpr bool has_slowdown = is_slowdown_array || is_slowdown_tree;
 
+        // the time transformation states what it requires of the interaction class
+        static_assert(InteractionOf<Tmethod, Ttransform, Tparticle, Tpcm, Tpert>, 
+                      "the interaction class does not provide what the time transformation requires: see AR::LogHInteraction and AR::TTLInteraction");
+
     protected:
         using Dynamics::time_;
         using Dynamics::etot_ref_;
@@ -240,6 +238,18 @@ namespace AR {
             return *this;
         }
 
+        //! whether the time transformation is TTL (otherwise LogH)
+        static constexpr bool isTTL() { return is_ttl; }
+
+        //! whether a Slow-down scheme is used
+        static constexpr bool hasSlowDown() { return has_slowdown; }
+
+        //! whether the Slow-down scheme is Array slow-down
+        static constexpr bool isSlowDownArray() { return is_slowdown_array; }
+
+        //! whether the Slow-down scheme is Tree slow-down
+        static constexpr bool isSlowDownTree() { return is_slowdown_tree; }
+
         //! number of inner slowed binaries, whatever the Slow-down scheme
         /*! Array slow-down: the list of slowed binaries; Tree slow-down: every binary of the tree; no Slow-down: zero
          */
@@ -247,6 +257,12 @@ namespace AR {
             if constexpr (is_slowdown_array) return this->binary_slowdown.getSize();
             else if constexpr (is_slowdown_tree) return info.binarytree.getSize();
             else return 0;
+        }
+
+        //! Slow-down of the i-th inner slowed binary, whatever the Slow-down scheme (see getSlowDownInnerNumber)
+        SlowDown& getSlowDownInner(const int _i) {
+            if constexpr (is_slowdown_array) return this->binary_slowdown[_i]->slowdown;
+            else return info.binarytree[_i].slowdown;
         }
 
         //! initialization for integration
