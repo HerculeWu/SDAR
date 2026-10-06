@@ -41,6 +41,21 @@ Three subdirectories exist:
 
 To use AR and Hermite, additional header files which define the interactions (calculation of the force and potential of pair interactions between singles and groups; calculation of perturbations for the slowdown method) should be provided separately, see sample codes for details.
 
+### Choosing the AR variant
+The AR integrator has two time transformations (_LogH_ and _TTL_) and three Slow-down schemes (none, _Array slow-down_ and _Tree slow-down_).
+A variant is chosen by naming two types as the last template arguments of the integrator:
+```cpp
+typedef AR::TimeTransformedSymplecticIntegrator<Particle, Particle, Perturber, Interaction, AR::Information<Particle,Particle>,
+                                                AR::TTL, AR::TreeSlowDown> ARInt;
+```
+The time transformation is `AR::LogH` or `AR::TTL`; the Slow-down scheme is `AR::NoSlowDown`, `AR::ArraySlowDown` or `AR::TreeSlowDown`.
+Several variants can be used in one program.
+When the two arguments are left out, the compiler flags `-D AR_TTL`, `-D AR_SLOWDOWN_ARRAY` and `-D AR_SLOWDOWN_TREE` select them as before (default: LogH without Slow-down).
+What a time transformation requires of the interaction class is stated by the concepts `AR::LogHInteraction` and `AR::TTLInteraction` (src/AR/interaction\_concept.h); the force type of a variant is `AR::ForceLogH` or `AR::ForceTTL`.
+
+### Tests
+`make -C test` builds and runs the unit tests. `test/golden/golden.py` (or `make -C test golden`) rebuilds every sample variant and compares its output byte-for-byte with recorded output, see test/golden/README.md.
+
 ## Use as independent code
 In sample directories, three subdirectories provide sample codes using the library, which can be used as independent codes for integrating few-body motions.
 Use `make` to compile the sample codes and `make install` to install the excutable fieles.
