@@ -33,3 +33,8 @@
 
 # emacs backup
 *~
+
+# Sample binaries
+sample/AR/ar.logh*
+sample/AR/ar.ttl*
+sample/Hermite/hermite
