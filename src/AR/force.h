@@ -1,5 +1,6 @@
 #pragma once
 
+#include <concepts>
 #include "Common/Float.h"
 #include "AR/variant.h"
 
@@ -101,6 +102,10 @@ namespace AR {
 
     template <class Ttransform>
     using ForceType = typename ForceTypeOf<Ttransform>::type;
+
+    //! the force type of TTL, which carries the gradient of the time transformation function
+    template <class Tforce>
+    concept TTLForce = std::same_as<Tforce, ForceTTL>;
 
     //! force class of one particle for the default time transformation
     typedef ForceType<DefaultTimeTransformation> Force;

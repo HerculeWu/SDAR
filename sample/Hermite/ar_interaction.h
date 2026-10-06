@@ -40,7 +40,8 @@ public:
       @param[in] _p2: particle 2
       \return the time transformation factor (gt_kick_inv) for kick step
     */
-    inline Float calcInnerAccPotAndGTKickInvTwo(AR::Force& _f1, AR::Force& _f2, Float& _epot, const Particle& _p1, const Particle& _p2) {
+    template <class Tforce>
+    inline Float calcInnerAccPotAndGTKickInvTwo(Tforce& _f1, Tforce& _f2, Float& _epot, const Particle& _p1, const Particle& _p2) {
         // acceleration
         const Float mass1 = _p1.mass;
         const Float* pos1 = _p1.pos;
@@ -75,20 +76,20 @@ public:
 
         Float gm1m2 = gravitational_constant*mass1*mass2;
 
-#ifdef AR_TTL 
-        // trans formation function gradient
-        Float gm1m2or3 = gm1m2*inv_r3;
-        Float* gtgrad1 = _f1.gtgrad;
-        Float* gtgrad2 = _f2.gtgrad;
+        if constexpr (AR::TTLForce<Tforce>) {
+            // trans formation function gradient
+            Float gm1m2or3 = gm1m2*inv_r3;
+            Float* gtgrad1 = _f1.gtgrad;
+            Float* gtgrad2 = _f2.gtgrad;
 
-        gtgrad1[0] = gm1m2or3 * dr[0];
-        gtgrad1[1] = gm1m2or3 * dr[1];
-        gtgrad1[2] = gm1m2or3 * dr[2];
+            gtgrad1[0] = gm1m2or3 * dr[0];
+            gtgrad1[1] = gm1m2or3 * dr[1];
+            gtgrad1[2] = gm1m2or3 * dr[2];
 
-        gtgrad2[0] = - gtgrad1[0];
-        gtgrad2[1] = - gtgrad1[1];
-        gtgrad2[2] = - gtgrad1[2];
-#endif
+            gtgrad2[0] = - gtgrad1[0];
+            gtgrad2[1] = - gtgrad1[1];
+            gtgrad2[2] = - gtgrad1[2];
+        }
 
         // potential energy
         Float gm1m2or = gm1m2*inv_r;
@@ -108,7 +109,8 @@ public:
       @param[in] _n_particle: number of member particles
       \return the time transformation factor (gt_kick_inv) for kick step
     */
-    inline Float calcInnerAccPotAndGTKickInv(AR::Force* _force, Float& _epot, const Particle* _particles, const int _n_particle) {
+    template <class Tforce>
+    inline Float calcInnerAccPotAndGTKickInv(Tforce* _force, Float& _epot, const Particle* _particles, const int _n_particle) {
         _epot = Float(0.0);
         Float gt_kick_inv = Float(0.0);
         for (int i=0; i<_n_particle; i++) {
@@ -117,10 +119,11 @@ public:
             Float* acci = _force[i].acc_in;
             acci[0] = acci[1] = acci[2] = Float(0.0);
 
-#ifdef AR_TTL 
-            Float* gtgradi = _force[i].gtgrad;
-            gtgradi[0] = gtgradi[1] = gtgradi[2] = Float(0.0);
-#endif
+            [[maybe_unused]] Float* gtgradi = NULL;
+            if constexpr (AR::TTLForce<Tforce>) {
+                gtgradi = _force[i].gtgrad;
+                gtgradi[0] = gtgradi[1] = gtgradi[2] = Float(0.0);
+            }
 
             Float poti = Float(0.0);
             Float gtki = Float(0.0);
@@ -140,12 +143,12 @@ public:
                 acci[1] += gmor3 * dr[1];
                 acci[2] += gmor3 * dr[2];
 
-#ifdef AR_TTL                     
-                Float gmimjor3 = massi*gmor3;
-                gtgradi[0] += gmimjor3 * dr[0];
-                gtgradi[1] += gmimjor3 * dr[1];
-                gtgradi[2] += gmimjor3 * dr[2];
-#endif
+                if constexpr (AR::TTLForce<Tforce>) {
+                    Float gmimjor3 = massi*gmor3;
+                    gtgradi[0] += gmimjor3 * dr[0];
+                    gtgradi[1] += gmimjor3 * dr[1];
+                    gtgradi[2] += gmimjor3 * dr[2];
+                }
 
                 Float gmor = gravitational_constant*massj*inv_r;
                 poti -= gmor;
@@ -169,7 +172,8 @@ public:
       @param[in] _perturber: pertuber container
       @param[in] _time: current time
     */
-    void calcAccPert(AR::Force* _force, const Particle* _particles, const int _n_particle, const H4Ptcl& _particle_cm, const H4::Neighbor<Particle>& _perturber, const Float _time) {
+    template <class Tforce>
+    void calcAccPert(Tforce* _force, const Particle* _particles, const int _n_particle, const H4Ptcl& _particle_cm, const H4::Neighbor<Particle>& _perturber, const Float _time) {
         static const Float inv3 = 1.0 / 3.0;
 
         const int n_pert = _perturber.neighbor_address.getSize();
@@ -333,7 +337,8 @@ public:
       @param[in] _time: current time
       \return perturbation energy to calculate slowdown factor
     */
-    Float calcAccPotAndGTKickInv(AR::Force* _force, Float& _epot, const Particle* _particles, const int _n_particle, const H4Ptcl& _particle_cm, const H4::Neighbor<Particle>& _perturber, const Float _time) {
+    template <class Tforce>
+    Float calcAccPotAndGTKickInv(Tforce* _force, Float& _epot, const Particle* _particles, const int _n_particle, const H4Ptcl& _particle_cm, const H4::Neighbor<Particle>& _perturber, const Float _time) {
         Float gt_kick_inv;
         if (_n_particle==2) gt_kick_inv = calcInnerAccPotAndGTKickInvTwo(_force[0], _force[1], _epot, _particles[0], _particles[1]);
         else gt_kick_inv = calcInnerAccPotAndGTKickInv(_force, _epot, _particles, _n_particle);
@@ -376,7 +381,8 @@ public:
 #endif
     }
 
-#if (defined AR_SLOWDOWN_ARRAY) || (defined AR_SLOWDOWN_TREE)
+    // ---- used only with a Slow-down scheme
+
     //! calculate slowdown perturbation and timescale from particle j to particle i
     /*! 
       @param[out] _pert_out: perturbation from particle j
@@ -526,10 +532,10 @@ public:
             }
         }
     }
-#endif
         
 
-#ifndef AR_TTL
+    // ---- used only by LogH
+
     //! (Necessary) calcualte the time transformation factor for drift
     /*! The time transformation factor for drift only depends on (kinetic energy - total energy)
       @param[in] _ekin_minus_etot: ekin - etot
@@ -545,7 +551,6 @@ public:
     Float calcH(Float _ekin_minus_etot, Float _epot) {
         return log(_ekin_minus_etot) - log(-_epot);
     }
-#endif   
 
     //! modify one particle function
     template <class Tparticle>
