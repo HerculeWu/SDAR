@@ -30,7 +30,7 @@ HERMITE_DIR = os.path.join(ROOT, "sample", "Hermite")
 TRIPLE = os.path.join(ROOT, "sample", "input", "triple.stable.lowm3")
 
 # AR sample binaries: ar.<variant>
-AR_VARIANTS = ["logh", "logh.sd.a", "logh.sd.t", "ttl", "ttl.m", "ttl.sd.a", "ttl.sd.t"]
+AR_VARIANTS = ["logh", "logh.sd.a", "logh.sd.t", "ttl", "ttl.sd.a", "ttl.sd.t"]
 
 # Regularization step of the "step" case, needed to continue from its dump
 # because the sample does not restore it on load.

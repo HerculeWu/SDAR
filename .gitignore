@@ -38,3 +38,9 @@
 sample/AR/ar.logh*
 sample/AR/ar.ttl*
 sample/Hermite/hermite
+
+# Unit tests
+test/unit_test
+
+# Golden output is recorded, not a build product (names like ar.logh.sd.a and *.out match the patterns above)
+!test/golden/expected/**

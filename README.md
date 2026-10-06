@@ -17,7 +17,7 @@ The major modes of versions are as follows:
 - **Test mode (test)**: This mode is unverified for proper functioning and should not be employed for production purposes.
 
 ## User Guide
-This c++11 library contains three components: _BinaryTree_, _AR_ and _Hermite_.
+This C++20 library contains three components: _BinaryTree_, _AR_ and _Hermite_.
 1. _BinaryTree_: transformation between Kepler orbital parameters and positions and velocities of binary components; construction for hierarchical systems by using binary tree.
 2. _AR_ algorithmical regularization or time-transformed explicit symplectic integrator with the slowdown method.
 3. _Hermite_: a hybrid method combines the 4^{th} order Hermite integrator and the AR method.

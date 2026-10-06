@@ -567,7 +567,14 @@ namespace AR {
             driftPosTreeIter(_dt, vel_cm, sd_factor, bin_root);
         }
 
-#ifdef AR_TIME_FUNCTION_MULTI_R
+        /* Reference only: time function from multiplied inverse separations (not compiled).
+           This variant of the Tree slow-down TTL time function replaced the kick and drift
+           factors by the product of the inverse separations of every binary in the hierarchy.
+           It was guarded by AR_TIME_FUNCTION_MULTI_R and never compiled (undefined names
+           _bini, calInvR, calcGTDriftInvIter). Its fragments are collected here.
+
+           Helpers:
+
         //! calc inverse R
         Float calcInvR(Tparticle& _p1, Tparticle& _p2) {
             Float dr[3] = {_p1.pos[0] - _p2.pos[0], 
@@ -597,7 +604,18 @@ namespace AR {
             }
             return gt_kick_inv;
         }
-#endif
+
+           At the end of calcAccPotAndGTKickInvTreeIter, before returning gt_kick_inv:
+
+            gt_kick_inv = calcMultiInvRIter(_bin);
+
+           In kickEtotAndGTDriftTreeIter, the accumulation
+           dgt_drift_inv += vel_sd . gtgrad was skipped.
+
+           In kickEtotAndGTDrift, after the tree iteration:
+
+            dgt_drift_inv = calcGTDriftInvIter(bin_root);
+        */
 
         //! calc force, potential and inverse time transformation factor for one pair of particles
         /*!
@@ -723,10 +741,6 @@ namespace AR {
             }
 
 
-#ifdef AR_TIME_FUNCTION_MULTI_R
-            gt_kick_inv = calcMultiInvRIter(_bin);
-#endif
-
             return gt_kick_inv;
         }
         
@@ -787,11 +801,9 @@ namespace AR {
                     de += particles[i].mass * (vel[0] * pert[0] +
                                                vel[1] * pert[1] +
                                                vel[2] * pert[2]);
-#ifndef AR_TIME_FUNCTION_MULTI_R
                     dgt_drift_inv +=  (vel_sd[0] * gtgrad[0] +
                                        vel_sd[1] * gtgrad[1] +
                                        vel_sd[2] * gtgrad[2]);
-#endif
                 }
             }
             etot_ref_     += _dt * de;
@@ -812,9 +824,6 @@ namespace AR {
             Float sd_factor=1.0;
 
             Float dgt_drift_inv = kickEtotAndGTDriftTreeIter(_dt, vel_cm, sd_factor, bin_root);
-#ifdef AR_TIME_FUNCTION_MULTI_R
-            dgt_drift_inv = calcGTDriftInvIter(bin_root);
-#endif
             gt_drift_inv_ += dgt_drift_inv*_dt;
         }
 

@@ -43,7 +43,7 @@ CXXFLAGS += -D ADJUST_GROUP_DEBUG
 
 ## Flag ----------------------------------------------#
 CXXFLAGS += -I../../src -I./
-CXXFLAGS += -std=c++11
+CXXFLAGS += -std=c++20
 CXXFLAGS += -D AR_SLOWDOWN_TIMESCALE
 #CXXFLAGS += -D AR_SLOWDOWN_MASSRATIO
 CXXFLAGS += -D AR_TTL
