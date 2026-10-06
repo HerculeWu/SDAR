@@ -260,7 +260,7 @@ namespace AR {
         }
 
         //! Slow-down of the i-th inner slowed binary, whatever the Slow-down scheme (see getSlowDownInnerNumber)
-        SlowDown& getSlowDownInner(const int _i) {
+        SlowDown& getSlowDownInner(const int _i) requires has_slowdown {
             if constexpr (is_slowdown_array) return this->binary_slowdown[_i]->slowdown;
             else return info.binarytree[_i].slowdown;
         }

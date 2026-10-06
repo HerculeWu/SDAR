@@ -71,7 +71,8 @@ TEST_CASE_TEMPLATE("Kepler orbit returns to its start after one period and conse
 
 // Inherited: the two-body step refreshes the Slow-down energies only after its last sub-step, while the LogH
 // time transformation reads them at every sub-step. A Kepler orbit under LogH with a Slow-down scheme therefore
-// carries an energy error of order 1e-3 even when its Slow-down factor is 1. Kept as it is, see the spec (#1).
+// carries an energy error of order 1e-3 even when its Slow-down factor is 1. Found while writing these tests and kept
+// as it is, because results must stay bitwise-identical to the previous version.
 TEST_CASE_TEMPLATE("inherited: Kepler orbit under LogH with a Slow-down scheme is only approximate", V, LogHArray, LogHTree) {
     const std::vector<Particle> start = keplerBinary();
     ArSystem<typename V::Integrator> system(start, NO_SLOWDOWN);

@@ -30,6 +30,7 @@ test: $(TARGET) compile_fail
 compile_fail: ${SOURCE}
 	@for f in compile_fail/*.cxx; do \
 		expect=`sed -n 's|^// expect: ||p' $$f`; \
+		if [ -z "$$expect" ]; then echo "compile_fail: $$f has no '// expect:' line"; exit 1; fi; \
 		if $(CXX) $(CXXFLAGS) -fsyntax-only $$f 2>compile_fail.log; then echo "compile_fail: $$f compiles, but must not"; exit 1; fi; \
 		if ! grep -q "$$expect" compile_fail.log; then echo "compile_fail: $$f fails without the message '$$expect'"; cat compile_fail.log; exit 1; fi; \
 		echo "compile_fail: $$f rejected as expected ($$expect)"; \
