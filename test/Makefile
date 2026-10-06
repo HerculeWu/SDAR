@@ -18,6 +18,7 @@ CXXFLAGS += -O2 -Wall
 ## Flag ----------------------------------------------#
 CXXFLAGS += -I../src -I./third_party -I./unit
 CXXFLAGS += -std=c++20
+CXXFLAGS += -D FIXTURE_DIR='"$(CURDIR)/fixtures"'
 
 ## Target --------------------------------------------#
 

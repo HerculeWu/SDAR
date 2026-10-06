@@ -1,11 +1,5 @@
-#include <iostream>
-#include <cmath>
-#include <cassert>
 #include "doctest.h"
-
-#define ASSERT(x) assert(x)
-
-#include "Common/Float.h"
+#include "test_support.h"
 #include "AR/symplectic_step.h"
 
 TEST_CASE("step-modification factor and error ratio are inverse of each other") {
